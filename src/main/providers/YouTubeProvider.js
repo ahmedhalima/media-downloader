@@ -19,13 +19,16 @@ class YouTubeProvider extends BaseProvider {
   async analyze(url, ytDlpWrap) {
     // --dump-single-json gives one JSON object for a video, or one
     // object with an "entries" array for a playlist — no extra
-    // branching needed for individual vs. playlist URLs.
+    // branching needed for individual vs. playlist URLs. We
+    // deliberately don't pass --flat-playlist: it speeds up listing
+    // large playlists, but it also skips fetching each entry's
+    // `formats`, which the quality picker needs. --playlist-items
+    // caps how many videos we'll read from a playlist so a huge one
+    // doesn't hang the Analyze call.
     const raw = await ytDlpWrap.execPromise([
       url,
       '--dump-single-json',
       '--no-warnings',
-      '--no-playlist-reload',
-      '--flat-playlist',
       '--playlist-items',
       '1-500'
     ]);
