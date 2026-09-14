@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self';" />
+<title>MediaDownloader</title>
+<link rel="stylesheet" href="styles/main.css" />
+</head>
+<body>
+  <div class="app" id="app">
+
+    <nav class="rail">
+      <div class="rail-brand">
+        <div class="rail-brand-mark">MD</div>
+        <div class="rail-brand-name">MediaDownloader</div>
+      </div>
+      <button class="rail-item is-active" data-view="analyze">
+        <span class="rail-icon">⤓</span>Analyze
+      </button>
+      <button class="rail-item" data-view="queue">
+        <span class="rail-icon">▤</span>Queue
+        <span class="rail-badge" id="queueBadge" hidden>0</span>
+      </button>
+      <button class="rail-item" data-view="history">
+        <span class="rail-icon">◷</span>History
+      </button>
+      <button class="rail-item" data-view="settings">
+        <span class="rail-icon">⚙</span>Settings
+      </button>
+      <div class="rail-footer" id="engineStatus">Preparing engine…</div>
+    </nav>
+
+    <main class="content">
+
+      <!-- ANALYZE VIEW -->
+      <section class="view" id="view-analyze">
+        <header class="view-header">
+          <h1>Add a video</h1>
+          <p>Paste a public YouTube or Facebook link — a single video, a playlist, or a live stream.</p>
+        </header>
+
+        <div class="url-bar">
+          <input id="urlInput" type="text" placeholder="https://www.youtube.com/watch?v=… or a Facebook video link" autocomplete="off" />
+          <button id="analyzeBtn" class="btn btn-primary">Analyze</button>
+        </div>
+        <p class="url-error" id="urlError" hidden></p>
+
+        <div class="analyze-result" id="analyzeResult" hidden>
+
+          <div class="media-card">
+            <img id="resultThumb" class="media-thumb" alt="" />
+            <div class="media-info">
+              <div class="media-title" id="resultTitle"></div>
+              <div class="media-meta" id="resultMeta"></div>
+              <div class="media-badges" id="resultBadges"></div>
+            </div>
+          </div>
+
+          <div class="options-grid">
+            <label class="field">
+              <span>Quality</span>
+              <select id="qualitySelect"></select>
+            </label>
+            <label class="field field-checkbox">
+              <input type="checkbox" id="audioOnlyToggle" />
+              <span>Audio only</span>
+            </label>
+          </div>
+
+          <div class="playlist-panel" id="playlistPanel" hidden>
+            <div class="playlist-panel-header">
+              <span id="playlistCount"></span>
+              <label class="field-checkbox">
+                <input type="checkbox" id="playlistSelectAll" checked />
+                <span>Select all</span>
+              </label>
+            </div>
+            <ul class="playlist-entries" id="playlistEntries"></ul>
+          </div>
+
+          <div class="action-row">
+            <button id="downloadBtn" class="btn btn-primary btn-lg">Download</button>
+            <button id="liveManifestBtn" class="btn btn-secondary" hidden>Save live stream as .m3u8</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- QUEUE VIEW -->
+      <section class="view" id="view-queue" hidden>
+        <header class="view-header">
+          <h1>Download queue</h1>
+          <p>Active, queued, and paused downloads.</p>
+        </header>
+        <ul class="task-list" id="queueList"></ul>
+        <p class="empty-state" id="queueEmpty">Nothing here yet. Analyze a link to get started.</p>
+      </section>
+
+      <!-- HISTORY VIEW -->
+      <section class="view" id="view-history" hidden>
+        <header class="view-header">
+          <h1>History</h1>
+          <p>Everything you've downloaded.</p>
+          <button id="clearHistoryBtn" class="btn btn-ghost btn-sm">Clear history</button>
+        </header>
+        <ul class="task-list" id="historyList"></ul>
+        <p class="empty-state" id="historyEmpty">No downloads completed yet.</p>
+      </section>
+
+      <!-- SETTINGS VIEW -->
+      <section class="view" id="view-settings" hidden>
+        <header class="view-header">
+          <h1>Settings</h1>
+          <p>Configure where files go and how downloads behave.</p>
+        </header>
+
+        <div class="settings-list">
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Download folder</div>
+              <div class="settings-hint" id="downloadFolderValue"></div>
+            </div>
+            <button id="chooseFolderBtn" class="btn btn-secondary btn-sm">Change…</button>
+          </div>
+
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Filename template</div>
+              <div class="settings-hint">Placeholders: {title} {uploader} {quality} {playlist} {playlist_index} {id} {date}</div>
+            </div>
+            <input id="filenameTemplateInput" type="text" class="settings-input" />
+          </div>
+
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Organize by platform</div>
+              <div class="settings-hint">Puts YouTube and Facebook downloads in separate folders.</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="organizeByProviderToggle" /><span></span></label>
+          </div>
+
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Default quality</div>
+              <div class="settings-hint">Used when you haven't picked one for a specific download.</div>
+            </div>
+            <select id="defaultQualitySelect" class="settings-input">
+              <option value="best">Best available</option>
+              <option value="2160">2160p</option>
+              <option value="1440">1440p</option>
+              <option value="1080">1080p</option>
+              <option value="720">720p</option>
+              <option value="480">480p</option>
+              <option value="360">360p</option>
+            </select>
+          </div>
+
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Original audio only</div>
+              <div class="settings-hint">Skips auto-dubbed audio tracks and keeps the video's original spoken language.</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="preferOriginalAudioToggle" /><span></span></label>
+          </div>
+
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Preferred audio format</div>
+              <div class="settings-hint">Used for audio-only downloads.</div>
+            </div>
+            <select id="audioFormatSelect" class="settings-input">
+              <option value="m4a">M4A</option>
+              <option value="mp3">MP3</option>
+              <option value="opus">Opus</option>
+              <option value="wav">WAV</option>
+            </select>
+          </div>
+
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Concurrent downloads</div>
+              <div class="settings-hint">How many downloads can run at the same time.</div>
+            </div>
+            <input id="concurrencyInput" type="number" min="1" max="10" class="settings-input settings-input-narrow" />
+          </div>
+
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Retry attempts</div>
+              <div class="settings-hint">Automatic retries before a download is marked failed.</div>
+            </div>
+            <input id="maxRetriesInput" type="number" min="0" max="10" class="settings-input settings-input-narrow" />
+          </div>
+
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Desktop notifications</div>
+              <div class="settings-hint">Notify when a download finishes or fails.</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="notificationsToggle" /><span></span></label>
+          </div>
+
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Minimize to tray on close</div>
+              <div class="settings-hint">Keep downloading in the background instead of quitting.</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="closeToTrayToggle" /><span></span></label>
+          </div>
+
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">Delete partial files on cancel</div>
+              <div class="settings-hint">Removes .part files left behind when you cancel a download.</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="deletePartialToggle" /><span></span></label>
+          </div>
+        </div>
+
+        <div class="settings-footer">
+          <button id="resetSettingsBtn" class="btn btn-ghost btn-sm">Reset to defaults</button>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <div class="toast-stack" id="toastStack"></div>
+
+  <script src="js/api.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
