@@ -147,6 +147,7 @@ document.getElementById('downloadBtn').addEventListener('click', async () => {
       }
       await api.enqueuePlaylist(entries, { provider: a.provider, qualityId, audioOnly });
       toast(`Queued ${entries.length} videos.`, 'success');
+      document.getElementById('queueList').scrollIntoView({ behavior: 'smooth', block: 'start' });
     } else {
       const res = await api.enqueueDownload({
         url: a.sourceUrl,
@@ -195,7 +196,7 @@ document.getElementById('liveManifestBtn').addEventListener('click', async () =>
       qualityId
     });
     toast('Resolving live stream manifest…', 'success');
-    switchView('queue');
+    document.getElementById('queueList').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (err) {
     toast(err.message || String(err), 'error');
   }
@@ -366,8 +367,7 @@ async function loadSettingsFrom(s) {
 /* ---------------- Live download updates ---------------- */
 api.onDownloadUpdate((task) => {
   state.tasks.set(task.id, task);
-  if (state.view === 'queue' || task.status === 'downloading' || task.status === 'queued') renderQueue();
-  else renderQueue();
+  renderQueue();
   if (task.status === 'completed' && state.view === 'history') renderHistory();
 });
 

@@ -15,10 +15,7 @@
         <div class="rail-brand-name">MediaDownloader</div>
       </div>
       <button class="rail-item is-active" data-view="analyze">
-        <span class="rail-icon">⤓</span>Analyze
-      </button>
-      <button class="rail-item" data-view="queue">
-        <span class="rail-icon">▤</span>Queue
+        <span class="rail-icon">⤓</span>Home
         <span class="rail-badge" id="queueBadge" hidden>0</span>
       </button>
       <button class="rail-item" data-view="history">
@@ -83,16 +80,12 @@
             <button id="liveManifestBtn" class="btn btn-secondary" hidden>Save live stream as .m3u8</button>
           </div>
         </div>
-      </section>
 
-      <!-- QUEUE VIEW -->
-      <section class="view" id="view-queue" hidden>
-        <header class="view-header">
-          <h1>Download queue</h1>
-          <p>Active, queued, and paused downloads.</p>
-        </header>
-        <ul class="task-list" id="queueList"></ul>
-        <p class="empty-state" id="queueEmpty">Nothing here yet. Analyze a link to get started.</p>
+        <div class="queue-section">
+          <h2 class="queue-heading">Download queue</h2>
+          <ul class="task-list" id="queueList"></ul>
+          <p class="empty-state" id="queueEmpty">Nothing here yet. Paste a link above to get started.</p>
+        </div>
       </section>
 
       <!-- HISTORY VIEW -->

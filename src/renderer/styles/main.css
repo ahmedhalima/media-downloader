@@ -267,6 +267,15 @@ button, input, select {
 
 .action-row { display: flex; gap: 12px; margin-top: 22px; }
 
+.queue-section { margin-top: 40px; max-width: 880px; }
+.queue-heading {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0 0 14px;
+  padding-top: 24px;
+  border-top: 1px solid var(--border);
+}
+
 /* ---------- Task list (Queue + History) ---------- */
 .task-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; max-width: 880px; }
 

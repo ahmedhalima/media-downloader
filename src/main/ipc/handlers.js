@@ -1,19 +1,31 @@
 'use strict';
 
 const { ipcMain, shell, dialog, Notification } = require('electron');
+const fs = require('fs');
 const { getLogger } = require('../utils/logger');
 
 const log = getLogger();
 
 function registerIpcHandlers({
   ytDlpWrap,
+  binaryManager,
   providerManager,
   downloadManager,
   historyStore,
   settingsStore,
   getWindow
 }) {
+  const engineNotReadyMessage =
+    'The download engine is still preparing itself (first-time setup). Please wait a few seconds and try again.';
+
+  function assertEngineReady() {
+    if (binaryManager && !fs.existsSync(binaryManager.ytDlpPath)) {
+      throw new Error(engineNotReadyMessage);
+    }
+  }
+
   ipcMain.handle('urls:analyze', async (_evt, url) => {
+    assertEngineReady();
     const provider = providerManager.resolve(url);
     if (!provider) {
       throw new Error('Unsupported URL. MediaDownloader currently supports YouTube and Facebook links.');
@@ -28,6 +40,7 @@ function registerIpcHandlers({
   });
 
   ipcMain.handle('downloads:enqueue', async (_evt, payload) => {
+    assertEngineReady();
     try {
       return downloadManager.enqueue(payload);
     } catch (err) {
@@ -39,10 +52,12 @@ function registerIpcHandlers({
   });
 
   ipcMain.handle('downloads:enqueuePlaylist', async (_evt, { entries, shared }) => {
+    assertEngineReady();
     return downloadManager.enqueuePlaylist(entries, shared);
   });
 
   ipcMain.handle('downloads:enqueueLiveManifest', async (_evt, payload) => {
+    assertEngineReady();
     return downloadManager.enqueueLiveManifest(payload);
   });
 
