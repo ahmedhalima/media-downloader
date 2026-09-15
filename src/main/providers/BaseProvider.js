@@ -25,42 +25,47 @@ class BaseProvider {
   /**
    * Returns normalized metadata:
    * {
-   *   isPlaylist: boolean,
-   *   title, thumbnail, durationSeconds, uploader,
+   *   isPlaylist, isLive, title, thumbnail, durationSeconds, uploader,
    *   qualities: [{ id, label, height, hasAudio, hasVideo, note }],
-   *   entries: [ { url, title, thumbnail, durationSeconds } ] // only if playlist
+   *   entries: [ { url, title, thumbnail, durationSeconds } ] // playlists only
    * }
    */
-  async analyze(_url, _ytDlp) {
+  async analyze(_url, _ytDlp, _options) {
     throw new Error('Provider must implement analyze');
   }
 
   /**
-   * Returns the yt-dlp format-selector string for a requested quality,
-   * with yt-dlp's own "best at or below this size" matching providing
-   * automatic fallback when the exact quality isn't available.
+   * Returns the yt-dlp format-selector string for a requested quality.
+   * Implementations must end their selector chain with a permissive
+   * fallback so a request never dies with "Requested format is not
+   * available" when an exact match is missing.
    */
   buildFormatSelector(_qualityId, _audioOnly) {
     throw new Error('Provider must implement buildFormatSelector');
   }
 
-  /**
-   * Extra provider-specific yt-dlp CLI args (rate limiting, cookies
-   * policy, language preferences, etc.). Receives the current app
-   * settings so behavior like "prefer original audio" can be toggled.
-   */
+  /** Extra provider-specific yt-dlp CLI args. Receives app settings. */
   extraArgs(_settings) {
     return [];
   }
 
   /**
-   * Returns the yt-dlp args needed to resolve the direct/manifest
-   * URL(s) for a format, used for the "save live stream as .m3u8"
-   * feature. Default implementation works for any yt-dlp-backed
-   * provider; override only if a provider needs special handling.
+   * Args used to resolve a live stream's HLS manifest URL for the
+   * "save as .m3u8" feature.
+   *
+   * This deliberately requests a *muxed* format rather than the
+   * usual bestvideo+bestaudio pair. With --get-url, a split selector
+   * prints two separate URLs (one video-only, one audio-only), and
+   * saving just the first yields a silent stream — which is exactly
+   * the "m3u8 without audio" bug. Asking for a combined format
+   * returns a single manifest that already carries both tracks.
    */
-  buildManifestArgs(url, qualityId) {
-    return [url, '-f', this.buildFormatSelector(qualityId, false), '--get-url', '--no-warnings'];
+  buildManifestArgs(url, qualityId, settings = {}) {
+    const height = parseInt(qualityId, 10);
+    const selector = Number.isNaN(height)
+      ? 'best[protocol^=m3u8]/best'
+      : `best[height<=${height}][protocol^=m3u8]/best[height<=${height}]/best`;
+    return [url, '-f', selector, '--get-url', ...this.extraArgs(settings)];
   }
 }
 

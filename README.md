@@ -111,6 +111,60 @@ npm run dist
 This uses `electron-builder` to produce an NSIS installer in `dist/`.
 Replace `assets/icon.ico` with your own branding before shipping.
 
+## Playlists
+
+Playlist links (`youtube.com/playlist?list=...`) show a numbered,
+checkbox list of entries so you can pick exactly what to queue. A
+`watch?v=...&list=...` link is treated as a **single video**, since
+that's a video being viewed in a playlist's context rather than a
+request for the whole playlist.
+
+Playlists are analyzed in two cheap stages rather than one expensive
+call: a flat listing of entries first, then a format probe of the first
+entry to populate the quality dropdown. Asking yt-dlp to fully resolve
+every video up front takes minutes on a large playlist and frequently
+fails outright.
+
+Numbering flows all the way through: entries are numbered in the
+picker, queued rows show `07/24 · Title`, and files on disk are
+numbered too — the default filename template is
+`{playlist}/{playlist_index} - {title}`, zero-padded to the playlist's
+width (`007` in a 120-item playlist) so they sort correctly in a file
+manager. Even if you've customized the template and dropped
+`{playlist_index}` from it, playlist downloads still get the number
+prepended to the filename automatically — a single video is never
+affected.
+
+Listing is capped at 500 entries; the picker says so when a playlist is
+longer.
+
+## History
+
+History has its own page (the clock icon in the toolbar, next to
+Settings) rather than sharing the downloads list — a full download log
+doesn't belong mixed in with active/queued items. It supports deleting
+individual entries or clearing everything, without touching the files
+already saved to disk.
+
+Queueing a playlist that includes videos you've already downloaded in
+the same quality no longer fails outright: those entries are skipped
+with a toast telling you how many, and the rest still queue normally.
+
+Settings → **Use sign-in from browser** lets MediaDownloader reuse the
+session from a browser you're already signed into on this PC (Chrome,
+Edge, Firefox, Brave, Opera, Vivaldi, Chromium). This is passed through
+to yt-dlp's `--cookies-from-browser`.
+
+This exists so you can download **your own** age-restricted or
+members-only content — it grants no access your account doesn't already
+have, and MediaDownloader never sees, requests, or stores your password.
+It is set to **None** by default.
+
+Note: close the browser fully before downloading. Chromium-based
+browsers lock their cookie database while running, and on Windows they
+additionally encrypt it with DPAPI, so cookie reads fail if the browser
+is open.
+
 ## Notes on the "original audio" and "live → .m3u8" features
 
 - **Original audio**: YouTube can offer a video with multiple dubbed audio
@@ -120,11 +174,54 @@ Replace `assets/icon.ico` with your own branding before shipping.
   comparable in quality. This is controlled by the **"Original audio
   only"** toggle in Settings (on by default).
 - **Live → .m3u8**: for a video flagged as live by the source site,
-  MediaDownloader can resolve the underlying HLS manifest URL (via
-  `yt-dlp --get-url`) and save its contents locally as a `.m3u8` file,
-  instead of recording the stream to a single video file. This only works
-  for public live streams the app can already reach, and does not attempt
-  to circumvent any access restriction.
+  MediaDownloader resolves the underlying HLS manifest URL (via
+  `yt-dlp --get-url`) and saves its contents locally as a `.m3u8` file,
+  instead of recording the stream to a single video file. It requests a
+  **muxed** format for this, so the saved manifest carries video *and*
+  audio — a `bestvideo+bestaudio` selector would print two separate URLs
+  and saving only the first produced a silent stream. If a resolved
+  manifest still advertises no audio track, the app flags it in the
+  list rather than handing over a mute file. This only works for public
+  live streams the app can already reach, and does not circumvent any
+  access restriction.
+
+## Filename templates
+
+The default template is `{playlist}/{title}`. Quality is deliberately
+**not** in the default filename: after automatic fallback, the delivered
+resolution often differs from the requested one, so baking it in is
+misleading. You can still add `{quality}` yourself if you want it.
+
+Optional fields (`{playlist}`, `{playlist_index}`, `{quality}`,
+`{date}`, `{year}`) render as empty rather than the literal `NA` when
+they don't apply, and path segments that collapse to nothing are
+dropped — so downloading a single video no longer creates a stray `NA`
+folder.
+
+## Titles showing in the wrong language
+
+YouTube can auto-translate a video's title/description server-side for
+viewers based on a language hint sent with each request. Left unset,
+that hint effectively defaults to English, so a video whose real title
+is Arabic (or any non-English language) could display in English here
+— while the downloaded *file* still used its correct original name,
+since that's written by a separate part of yt-dlp.
+
+Settings → **Title language** fixes this by sending that hint
+explicitly and using the same value for both analyzing and downloading,
+so the title shown in the app and the one in the filename always match.
+**Automatic** (the default) matches this PC's Windows display language;
+you can also pick a specific language if you're downloading content in
+a language different from your system's.
+
+## Application menu
+
+The menu bar is intentionally minimal: **File** (paste/analyze, open
+downloads folder, settings, quit), **Downloads** (pause/resume all,
+clear completed), and **Help**. There's no separate Edit or View menu
+— cut/copy/paste on the URL field works via its right-click menu, and
+there's nothing else in the app that needs zooming or dev tools in
+normal use.
 
 ## Security & privacy
 

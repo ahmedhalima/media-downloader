@@ -1,7 +1,12 @@
 'use strict';
 
 const { BaseProvider } = require('./BaseProvider');
-const { normalizeAnalysis } = require('./metadataUtils');
+const { normalizeAnalysis, summarizeQualities, toEntryMetadata } = require('./metadataUtils');
+const { resolveMetadataLanguage } = require('../utils/locale');
+
+// Hard cap on how many playlist entries we'll list. Very large
+// playlists otherwise make a single yt-dlp call run for minutes.
+const MAX_PLAYLIST_ITEMS = 500;
 
 class YouTubeProvider extends BaseProvider {
   get id() {
@@ -13,30 +18,127 @@ class YouTubeProvider extends BaseProvider {
   }
 
   canHandle(url) {
-    return /(^|\.)youtube\.com$/i.test(hostOf(url)) || /^youtu\.be$/i.test(hostOf(url));
+    const host = hostOf(url);
+    return /(^|\.)youtube\.com$/i.test(host) || /^youtu\.be$/i.test(host);
   }
 
-  async analyze(url, ytDlpWrap) {
-    // --dump-single-json gives one JSON object for a video, or one
-    // object with an "entries" array for a playlist — no extra
-    // branching needed for individual vs. playlist URLs. We
-    // deliberately don't pass --flat-playlist: it speeds up listing
-    // large playlists, but it also skips fetching each entry's
-    // `formats`, which the quality picker needs. --playlist-items
-    // caps how many videos we'll read from a playlist so a huge one
-    // doesn't hang the Analyze call.
-    const raw = await ytDlpWrap.execPromise([
+  /**
+   * A /watch?v=...&list=... URL is a *video being viewed in the
+   * context of a playlist*, not a request to download the playlist.
+   * Only an explicit /playlist URL (or an explicit caller request) is
+   * treated as a playlist.
+   */
+  isPlaylistUrl(url, forcePlaylist = false) {
+    try {
+      const u = new URL(url);
+      if (/\/playlist/i.test(u.pathname)) return true;
+      if (forcePlaylist && u.searchParams.has('list')) return true;
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async analyze(url, ytDlpWrap, options = {}) {
+    const settings = options.settings || {};
+    const run = options.run; // injected runner that captures stderr
+
+    if (this.isPlaylistUrl(url, options.forcePlaylist)) {
+      return this._analyzePlaylist(url, run, settings);
+    }
+    return this._analyzeSingle(url, run, settings);
+  }
+
+  async _analyzeSingle(url, run, settings) {
+    const raw = await run([
       url,
       '--dump-single-json',
-      '--no-warnings',
-      '--playlist-items',
-      '1-500'
+      '--no-playlist',
+      ...this.analyzeArgs(settings)
     ]);
+
     const info = JSON.parse(raw);
     const normalized = normalizeAnalysis(info);
     normalized.provider = this.id;
     normalized.sourceUrl = url;
+    normalized.playlistAvailable = /[?&]list=/.test(url);
     return normalized;
+  }
+
+  /**
+   * Playlists are analyzed in two cheap stages instead of one
+   * expensive call.
+   *
+   * Asking for --dump-single-json on a playlist WITHOUT
+   * --flat-playlist makes yt-dlp fully resolve every single video
+   * (formats, signatures, the lot). On a playlist of any real size
+   * that takes minutes and frequently fails outright — which is what
+   * produced the "Command failed" error.
+   *
+   * Stage 1 lists entries flat (fast, one request).
+   * Stage 2 resolves formats for just the FIRST entry, which is
+   * enough to populate the quality dropdown. Per-video fallback at
+   * download time handles any entry whose formats differ.
+   */
+  async _analyzePlaylist(url, run, settings) {
+    const listRaw = await run([
+      url,
+      '--dump-single-json',
+      '--flat-playlist',
+      '--yes-playlist',
+      '--playlist-items',
+      `1-${MAX_PLAYLIST_ITEMS}`,
+      ...this.analyzeArgs(settings)
+    ]);
+
+    const info = JSON.parse(listRaw);
+    const rawEntries = Array.isArray(info.entries) ? info.entries.filter(Boolean) : [];
+
+    if (!rawEntries.length) {
+      throw new Error(
+        'This playlist appears to be empty, private, or unavailable. Public playlists only.'
+      );
+    }
+
+    const entries = rawEntries.map((e, i) => {
+      const meta = toEntryMetadata(e);
+      // Flat entries sometimes carry only an id; rebuild a usable URL.
+      if (!meta.url || !/^https?:/i.test(meta.url)) {
+        meta.url = `https://www.youtube.com/watch?v=${e.id}`;
+      }
+      meta.index = i + 1; // 1-based position shown in the UI
+      return meta;
+    });
+
+    // Stage 2: qualities from the first entry only. A failure here is
+    // non-fatal — we fall back to the standard ladder so the user can
+    // still queue the playlist.
+    let qualities;
+    try {
+      const probeRaw = await run([
+        entries[0].url,
+        '--dump-single-json',
+        '--no-playlist',
+        ...this.analyzeArgs(settings)
+      ]);
+      qualities = summarizeQualities(JSON.parse(probeRaw).formats || []);
+    } catch (_) {
+      qualities = summarizeQualities([]);
+    }
+
+    return {
+      isPlaylist: true,
+      isLive: false,
+      provider: this.id,
+      sourceUrl: url,
+      title: info.title || 'Untitled playlist',
+      thumbnail: entries[0].thumbnail || null,
+      uploader: info.uploader || info.channel || null,
+      entryCount: entries.length,
+      truncated: entries.length >= MAX_PLAYLIST_ITEMS,
+      entries,
+      qualities
+    };
   }
 
   buildFormatSelector(qualityId, audioOnly) {
@@ -48,23 +150,67 @@ class YouTubeProvider extends BaseProvider {
     }
     const height = parseInt(qualityId, 10);
     if (Number.isNaN(height)) return 'bestvideo*+bestaudio/best';
-    // height<=N lets yt-dlp automatically fall back to the next best
-    // resolution at or below the requested one when an exact match
-    // isn't available.
-    return `bestvideo*[height<=${height}]+bestaudio/best[height<=${height}]`;
+
+    // Fallback chain, widest-to-narrowest. The trailing bare `best`
+    // prevents "Requested format is not available" when a video has
+    // no stream at or below the requested height.
+    return [
+      `bestvideo*[height<=${height}]+bestaudio`,
+      `best[height<=${height}]`,
+      'bestvideo*+bestaudio',
+      'best'
+    ].join('/');
+  }
+
+  /**
+   * Args safe for metadata extraction. Notably this omits
+   * --format-sort, which is a download-time concern and only adds a
+   * failure surface to a JSON dump.
+   */
+  analyzeArgs(settings = {}) {
+    const args = ['--no-warnings', '--ignore-config', ...this.metadataLangArgs(settings)];
+    if (settings.cookiesFromBrowser && settings.cookiesFromBrowser !== 'none') {
+      args.push('--cookies-from-browser', settings.cookiesFromBrowser);
+    }
+    return args;
+  }
+
+  /**
+   * `--extractor-args "youtube:lang=XX"` tells YouTube which language
+   * to serve translated metadata in when a translation exists. Left
+   * unset, YouTube's response effectively defaults to English titles
+   * for videos that have an English auto-translation available — which
+   * is why an Arabic video's title could show in English here even
+   * though the actual video stream (and its filename on disk) is
+   * unaffected. Requesting the video's own language is what makes
+   * YouTube hand back the un-translated original title, and using the
+   * SAME language for analyze and download keeps the title shown in
+   * the app and the one baked into the filename consistent with each
+   * other.
+   */
+  metadataLangArgs(settings = {}) {
+    // eslint-disable-next-line global-require
+    const { app } = require('electron');
+    const lang = resolveMetadataLanguage(settings.metadataLanguage, app.getLocale());
+    return lang ? ['--extractor-args', `youtube:lang=${lang}`] : [];
   }
 
   extraArgs(settings = {}) {
-    const args = ['--no-warnings'];
+    const args = ['--no-warnings', ...this.metadataLangArgs(settings)];
+
     if (settings.preferOriginalAudio !== false) {
-      // YouTube auto-dubs many videos into other languages. Formats
-      // for the original track carry the highest "language
-      // preference" score internally; sorting on "lang" (and
-      // deliberately never passing --extractor-args youtube:lang=...,
-      // which would request a specific dub) makes yt-dlp pick that
-      // original track instead of a same-bitrate dubbed one.
+      // YouTube auto-dubs many videos. Sorting on "lang" (and never
+      // requesting a specific dub) makes yt-dlp prefer the original.
       args.push('--format-sort', 'lang');
     }
+
+    // Reuses a browser session the user is already signed into on this
+    // machine. No password is seen or stored, and it grants no access
+    // the user doesn't already have.
+    if (settings.cookiesFromBrowser && settings.cookiesFromBrowser !== 'none') {
+      args.push('--cookies-from-browser', settings.cookiesFromBrowser);
+    }
+
     return args;
   }
 }
@@ -77,4 +223,4 @@ function hostOf(url) {
   }
 }
 
-module.exports = { YouTubeProvider };
+module.exports = { YouTubeProvider, MAX_PLAYLIST_ITEMS };

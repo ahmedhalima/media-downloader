@@ -3,7 +3,8 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('mediaDownloader', {
-  analyzeUrl: (url) => ipcRenderer.invoke('urls:analyze', url),
+  analyzeUrl: (url, options = {}) => ipcRenderer.invoke('urls:analyze', { url, ...options }),
+  showInputContextMenu: (info) => ipcRenderer.invoke('ui:showInputContextMenu', info),
 
   enqueueDownload: (payload) => ipcRenderer.invoke('downloads:enqueue', payload),
   enqueuePlaylist: (entries, shared) => ipcRenderer.invoke('downloads:enqueuePlaylist', { entries, shared }),
@@ -36,8 +37,25 @@ contextBridge.exposeInMainWorld('mediaDownloader', {
 
   openPath: (filePath) => ipcRenderer.invoke('shell:openPath', filePath),
   showInFolder: (filePath) => ipcRenderer.invoke('shell:showInFolder', filePath),
+  readClipboard: () => ipcRenderer.invoke('clipboard:read'),
 
   listProviders: () => ipcRenderer.invoke('providers:list'),
+
+  onMenuCommand: (cb) => {
+    const channels = [
+      'menu:pasteLink',
+      'menu:openSettings',
+      'menu:pauseAll',
+      'menu:resumeAll',
+      'menu:clearCompleted'
+    ];
+    const listeners = channels.map((ch) => {
+      const fn = () => cb(ch.replace('menu:', ''));
+      ipcRenderer.on(ch, fn);
+      return [ch, fn];
+    });
+    return () => listeners.forEach(([ch, fn]) => ipcRenderer.removeListener(ch, fn));
+  },
 
   onAppStatus: (cb) => {
     const listener = (_evt, status) => cb(status);

@@ -1,7 +1,18 @@
 'use strict';
 
 const path = require('path');
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, Menu, shell, dialog } = require('electron');
+
+// yt-dlp.exe is a Python build; on Windows, a piped (non-console)
+// stdout can silently fall back to the system's ANSI codepage instead
+// of UTF-8, corrupting non-Latin titles (Arabic, CJK, etc.) in output
+// we capture — even though the actual downloaded file, written via
+// Windows' native filesystem APIs, ends up named correctly. Setting
+// this before any child process is spawned forces Python's stdio to
+// UTF-8 regardless of the console codepage. Must happen this early,
+// before yt-dlp-wrap or anything else spawns the binary.
+process.env.PYTHONUTF8 = '1';
+process.env.PYTHONIOENCODING = 'utf-8';
 
 const { getLogger } = require('./utils/logger');
 const { SettingsStore } = require('./core/SettingsStore');
@@ -15,6 +26,83 @@ const { registerIpcHandlers } = require('./ipc/handlers');
 let mainWindow = null;
 let tray = null;
 let log = null;
+
+/**
+ * Electron installs a generic default menu (Help -> "Learn More",
+ * Electron docs links, etc.) when none is set. Replace it with a menu
+ * that actually belongs to this app.
+ */
+function buildApplicationMenu({ getWindow, settingsStore }) {
+  const isMac = process.platform === 'darwin';
+
+  const template = [
+    {
+      label: 'File',
+      submenu: [
+        {
+          label: 'Paste Link & Analyze',
+          accelerator: 'CmdOrCtrl+V',
+          click: () => sendToRenderer('menu:pasteLink')
+        },
+        {
+          label: 'Open Downloads Folder',
+          click: () => {
+            const folder = settingsStore.get('downloadFolder');
+            if (folder) shell.openPath(folder);
+          }
+        },
+        { type: 'separator' },
+        {
+          label: 'Settings',
+          accelerator: 'CmdOrCtrl+,',
+          click: () => sendToRenderer('menu:openSettings')
+        },
+        { type: 'separator' },
+        isMac ? { role: 'close' } : { role: 'quit' }
+      ]
+    },
+    {
+      label: 'Downloads',
+      submenu: [
+        { label: 'Pause All', click: () => sendToRenderer('menu:pauseAll') },
+        { label: 'Resume All', click: () => sendToRenderer('menu:resumeAll') },
+        { type: 'separator' },
+        { label: 'Clear Completed', click: () => sendToRenderer('menu:clearCompleted') }
+      ]
+    },
+    {
+      label: 'Help',
+      submenu: [
+        {
+          label: 'About MediaDownloader',
+          click: () => {
+            dialog.showMessageBox(getWindow(), {
+              type: 'info',
+              title: 'About MediaDownloader',
+              message: `MediaDownloader ${app.getVersion()}`,
+              detail:
+                'Downloads public and authorized videos from YouTube and Facebook.\n\n' +
+                'Powered by yt-dlp and FFmpeg. This app never stores your passwords ' +
+                'and does not bypass access restrictions.',
+              buttons: ['OK']
+            });
+          }
+        },
+        {
+          label: 'Open Log Folder',
+          click: () => shell.openPath(path.join(app.getPath('userData'), 'logs'))
+        }
+      ]
+    }
+  ];
+
+  function sendToRenderer(channel) {
+    const win = getWindow();
+    if (win && !win.isDestroyed()) win.webContents.send(channel);
+  }
+
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -85,6 +173,7 @@ async function bootstrap() {
 
   const downloadManager = new DownloadManager({
     ytDlpWrap,
+    ytDlpPath: binaryManager.ytDlpPath,
     ffmpegPath: binaryManager.ffmpegPath,
     settingsStore,
     historyStore,
@@ -100,6 +189,8 @@ async function bootstrap() {
     settingsStore,
     getWindow: () => mainWindow
   });
+
+  buildApplicationMenu({ getWindow: () => mainWindow, settingsStore });
 
   const trayManager = new TrayManager({
     getWindow: () => mainWindow,

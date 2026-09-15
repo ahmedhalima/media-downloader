@@ -8,6 +8,7 @@ const { EventEmitter } = require('events');
 const { v4: uuid } = require('uuid');
 const { getLogger } = require('../utils/logger');
 const { buildOutputPath } = require('../utils/filenameTemplate');
+const { runYtDlp } = require('../utils/ytdlpRunner');
 
 const log = getLogger();
 
@@ -33,9 +34,10 @@ const STATUS = Object.freeze({
  * rather than starting over.
  */
 class DownloadManager extends EventEmitter {
-  constructor({ ytDlpWrap, ffmpegPath, settingsStore, historyStore, providerManager }) {
+  constructor({ ytDlpWrap, ytDlpPath, ffmpegPath, settingsStore, historyStore, providerManager }) {
     super();
     this.ytDlpWrap = ytDlpWrap;
+    this.ytDlpPath = ytDlpPath;
     this.ffmpegPath = ffmpegPath;
     this.settingsStore = settingsStore;
     this.historyStore = historyStore;
@@ -44,6 +46,14 @@ class DownloadManager extends EventEmitter {
     /** @type {Map<string, object>} */
     this.tasks = new Map();
     this.activeCount = 0;
+  }
+
+  /**
+   * Runs yt-dlp capturing stderr, so live-manifest failures report the
+   * real cause rather than just the command that failed.
+   */
+  runYtDlp(args) {
+    return runYtDlp(this.ytDlpPath, args, { timeoutMs: 120000 });
   }
 
   getAll() {
@@ -62,6 +72,37 @@ class DownloadManager extends EventEmitter {
   }
 
   /**
+   * Builds a task object without any duplicate check or side effects
+   * (not added to the queue, no events fired) — callers decide that.
+   */
+  _buildTask(input, settings) {
+    return {
+      id: uuid(),
+      url: input.url,
+      title: input.title || input.url,
+      thumbnail: input.thumbnail || null,
+      durationSeconds: input.durationSeconds || null,
+      provider: input.provider,
+      qualityId: input.qualityId || settings.defaultQuality,
+      audioOnly: !!input.audioOnly,
+      playlistIndex: input.playlistIndex || null,
+      playlistTitle: input.playlistTitle || null,
+      playlistTotal: input.playlistTotal || null,
+      status: STATUS.QUEUED,
+      progressPercent: 0,
+      speed: null,
+      eta: null,
+      totalSizeText: null,
+      retries: 0,
+      maxRetries: settings.maxRetries,
+      filePath: null,
+      error: null,
+      createdAt: Date.now(),
+      process: null
+    };
+  }
+
+  /**
    * @param {object} input { url, provider, title, thumbnail, durationSeconds,
    *   qualityId, audioOnly, sourceId (video id from analyze, for dedupe) }
    */
@@ -76,28 +117,7 @@ class DownloadManager extends EventEmitter {
       throw err;
     }
 
-    const task = {
-      id: uuid(),
-      url: input.url,
-      title: input.title || input.url,
-      thumbnail: input.thumbnail || null,
-      durationSeconds: input.durationSeconds || null,
-      provider: input.provider,
-      qualityId: input.qualityId || settings.defaultQuality,
-      audioOnly: !!input.audioOnly,
-      status: STATUS.QUEUED,
-      progressPercent: 0,
-      speed: null,
-      eta: null,
-      totalSizeText: null,
-      retries: 0,
-      maxRetries: settings.maxRetries,
-      filePath: null,
-      error: null,
-      createdAt: Date.now(),
-      process: null
-    };
-
+    const task = this._buildTask(input, settings);
     this.tasks.set(task.id, task);
     this._emitUpdate(task);
     this._tryStartNext();
@@ -141,16 +161,49 @@ class DownloadManager extends EventEmitter {
     return this._publicView(task);
   }
 
+  /**
+   * Queues every selected playlist entry, skipping ones already in
+   * history instead of throwing. A single duplicate used to abort the
+   * whole batch (Array.map does not catch per-item), which is what
+   * produced an "Error: DUPLICATE" for the entire playlist even when
+   * only one of many videos had already been downloaded.
+   *
+   * @returns {{ queued: object[], skipped: { url, title }[] }}
+   */
   enqueuePlaylist(entries, shared) {
-    return entries.map((entry) =>
-      this.enqueue({
-        ...shared,
-        url: entry.url,
-        title: entry.title,
-        thumbnail: entry.thumbnail,
-        durationSeconds: entry.durationSeconds
-      })
-    );
+    const settings = this.settingsStore.getAll();
+    const queued = [];
+    const skipped = [];
+
+    entries.forEach((entry, i) => {
+      const duplicate = this.historyStore.findDuplicate(entry.url, shared.qualityId, shared.audioOnly);
+      if (duplicate && !shared.allowDuplicates) {
+        skipped.push({ url: entry.url, title: entry.title });
+        return;
+      }
+
+      const task = this._buildTask(
+        {
+          ...shared,
+          url: entry.url,
+          title: entry.title,
+          thumbnail: entry.thumbnail,
+          durationSeconds: entry.durationSeconds,
+          // Position within the playlist, used for display and for the
+          // {playlist_index} filename placeholder.
+          playlistIndex: entry.index || i + 1,
+          playlistTitle: shared.playlistTitle || null,
+          playlistTotal: entries.length
+        },
+        settings
+      );
+      this.tasks.set(task.id, task);
+      this._emitUpdate(task);
+      queued.push(this._publicView(task));
+    });
+
+    this._tryStartNext();
+    return { queued, skipped };
   }
 
   _tryStartNext() {
@@ -183,7 +236,9 @@ class DownloadManager extends EventEmitter {
 
     try {
       const settings = this.settingsStore.getAll();
-      const raw = await this.ytDlpWrap.execPromise(provider.buildManifestArgs(task.url, task.qualityId));
+      const raw = await this.runYtDlp(
+        provider.buildManifestArgs(task.url, task.qualityId, settings)
+      );
       const manifestUrl = raw
         .split('\n')
         .map((l) => l.trim())
@@ -200,6 +255,17 @@ class DownloadManager extends EventEmitter {
       const manifestText = await fetchText(manifestUrl);
       if (!/^#EXTM3U/m.test(manifestText)) {
         throw new Error('The resolved stream is not an HLS (.m3u8) manifest.');
+      }
+
+      // Sanity check: a master playlist that advertises video but
+      // declares no audio (no AUDIO= attribute and no audio media
+      // group) would play silently. Flag it rather than silently
+      // handing the user a mute stream.
+      const isMaster = /#EXT-X-STREAM-INF/.test(manifestText);
+      const hasAudio =
+        /TYPE=AUDIO/.test(manifestText) || /AUDIO="/.test(manifestText) || !isMaster;
+      if (!hasAudio) {
+        task.warning = 'This manifest contains no audio track.';
       }
 
       const downloadRoot = settings.organizeByProvider
@@ -245,7 +311,14 @@ class DownloadManager extends EventEmitter {
       : settings.downloadFolder;
     fs.mkdirSync(downloadRoot, { recursive: true });
 
-    const outputTemplate = buildOutputPath(downloadRoot, settings.filenameTemplate);
+    // Each task downloads with --no-playlist, so yt-dlp has no idea of
+    // the video's position in a playlist. Substitute the values we
+    // recorded at enqueue time directly into the output template, and
+    // zero-pad the index so files sort correctly in a file manager.
+    const outputTemplate = applyPlaylistFields(
+      buildOutputPath(downloadRoot, settings.filenameTemplate),
+      task
+    );
     const formatSelector = provider.buildFormatSelector(task.qualityId, task.audioOnly);
 
     const args = [
@@ -255,6 +328,13 @@ class DownloadManager extends EventEmitter {
       '--ffmpeg-location', this.ffmpegPath,
       '--newline',
       '--no-mtime',
+      // Each queued task is exactly one video — playlists are expanded
+      // into individual tasks at enqueue time. Without this, a URL that
+      // happens to carry &list= would pull down the entire playlist.
+      '--no-playlist',
+      // Ensures the "NA" placeholder never reaches a path segment even
+      // if a template field resolves to nothing.
+      '--output-na-placeholder', '',
       '--print', 'after_move:MEDIADL_FILEPATH:%(filepath)s',
       ...(task.audioOnly ? ['-x', '--audio-format', settings.preferredAudioFormat] : []),
       ...(!task.audioOnly ? ['--merge-output-format', 'mp4'] : []),
@@ -288,6 +368,12 @@ class DownloadManager extends EventEmitter {
           if (typeof eventData === 'string' && eventData.includes('MEDIADL_FILEPATH:')) {
             task.filePath = eventData.split('MEDIADL_FILEPATH:')[1].trim();
           }
+          // Keep the most recent real yt-dlp error line around so a
+          // failure reports what actually went wrong rather than just
+          // an exit code.
+          if (typeof eventData === 'string' && /^ERROR[:\s]/i.test(eventData.trim())) {
+            task.rawError = eventData.trim();
+          }
         });
 
         emitter.on('error', (err) => {
@@ -317,7 +403,8 @@ class DownloadManager extends EventEmitter {
             this.emit('task:completed', this._publicView(task));
           } else if (task.status !== STATUS.COMPLETED) {
             task.status = STATUS.ERROR;
-            task.error = task.error || `yt-dlp exited with code ${code}`;
+            task.error =
+              task.error || (task.rawError ? humanizeError(new Error(task.rawError)) : `yt-dlp exited with code ${code}`);
             this._emitUpdate(task);
             this.emit('task:error', this._publicView(task));
           }
@@ -447,6 +534,55 @@ class DownloadManager extends EventEmitter {
   }
 }
 
+/**
+ * Replaces %(playlist)s / %(playlist_index)s in an output template
+ * with the values captured at enqueue time, since the per-video
+ * download runs with --no-playlist and yt-dlp can't supply them.
+ *
+ * The index is zero-padded to the width of the playlist's total count
+ * (e.g. 007 in a 120-item playlist) so files sort naturally on disk.
+ *
+ * If the template has no {playlist_index} placeholder at all — e.g. a
+ * filename template saved before this feature existed — the number is
+ * still prepended to the filename automatically, so playlist downloads
+ * are always numbered on disk regardless of a custom template.
+ */
+function applyPlaylistFields(template, task) {
+  let out = template;
+  const hadIndexPlaceholder = /%\(playlist_index\|?\)s/.test(template);
+
+  if (task.playlistIndex) {
+    const width = String(task.playlistTotal || task.playlistIndex).length;
+    const padded = String(task.playlistIndex).padStart(Math.max(2, width), '0');
+    out = out.replace(/%\(playlist_index\|?\)s/g, padded);
+
+    if (!hadIndexPlaceholder) {
+      // Prepend "NN - " to the filename (last path segment) only.
+      const parts = out.split(path.sep);
+      const last = parts.pop();
+      parts.push(`${padded} - ${last}`);
+      out = parts.join(path.sep);
+    }
+  } else {
+    out = out.replace(/%\(playlist_index\|?\)s/g, '');
+  }
+
+  if (task.playlistTitle) {
+    out = out.replace(/%\(playlist\|?\)s/g, sanitizeFilename(task.playlistTitle));
+  } else {
+    out = out.replace(/%\(playlist\|?\)s/g, '');
+  }
+
+  // Collapse any path segments that just became empty, so a single
+  // video never lands in a blank or stray folder.
+  const parts = out.split(path.sep);
+  const cleaned = parts.filter((seg, i) => i === 0 || seg.trim().length > 0);
+  out = cleaned.join(path.sep);
+
+  // Tidy up separators/spaces left behind by a removed placeholder.
+  return out.replace(/\s{2,}/g, ' ').replace(/(^|[\\/])[\s\-_.]+/g, '$1');
+}
+
 /** Fetches a text resource (used for HLS manifests), following redirects. */
 function fetchText(url, redirectsLeft = 5) {
   return new Promise((resolve, reject) => {
@@ -493,13 +629,26 @@ function capitalize(s) {
 
 function humanizeError(err) {
   const msg = (err && err.message) || String(err);
+  if (/Requested format is not available/i.test(msg)) {
+    return 'That quality is not available for this video. Try "Best" or a lower resolution.';
+  }
   if (/HTTP Error 403/i.test(msg)) return 'Access denied by the source site (403).';
-  if (/Private video|login required/i.test(msg)) {
-    return 'This content is private or requires login — MediaDownloader only downloads public content.';
+  if (/Private video|login required|Sign in to confirm/i.test(msg)) {
+    return 'This content is private or requires sign-in. If your own account can view it, enable "Use sign-in from browser" in Settings.';
+  }
+  if (/could not find .* cookies|unable to open cookie|DPAPI|Permission denied.*[Cc]ookies/i.test(msg)) {
+    return 'Could not read cookies from the selected browser. Close the browser fully and try again, or set it back to "None" in Settings.';
   }
   if (/Video unavailable/i.test(msg)) return 'This video is unavailable.';
-  if (/network|ENOTFOUND|ECONNRESET/i.test(msg)) return 'Network error — check your internet connection.';
-  return msg.split('\n')[0].slice(0, 300);
+  if (/is not a valid URL|Unsupported URL/i.test(msg)) return 'That link is not a supported video URL.';
+  if (/network|ENOTFOUND|ECONNRESET|Temporary failure/i.test(msg)) {
+    return 'Network error — check your internet connection.';
+  }
+  // Strip yt-dlp's noisy prefix but keep the substance of the message.
+  return msg
+    .split('\n')[0]
+    .replace(/^ERROR:\s*/i, '')
+    .slice(0, 300);
 }
 
 module.exports = { DownloadManager, STATUS };
