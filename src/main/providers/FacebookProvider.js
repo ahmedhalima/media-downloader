@@ -55,15 +55,18 @@ class FacebookProvider extends BaseProvider {
     return args;
   }
 
-  buildFormatSelector(qualityId, audioOnly) {
+  buildFormatSelector(qualityId, audioOnly, { isLive = false } = {}) {
     if (audioOnly) {
       return 'bestaudio/best';
     }
-    if (!qualityId || qualityId === 'best') {
-      return 'bestvideo*+bestaudio/best';
+
+    const height = qualityId && qualityId !== 'best' ? parseInt(qualityId, 10) : null;
+
+    if (isLive) {
+      return height && !Number.isNaN(height) ? `best[height<=${height}]/best` : 'best';
     }
-    const height = parseInt(qualityId, 10);
-    if (Number.isNaN(height)) return 'bestvideo*+bestaudio/best';
+
+    if (!height || Number.isNaN(height)) return 'bestvideo*+bestaudio/best';
 
     return [
       `bestvideo*[height<=${height}]+bestaudio`,

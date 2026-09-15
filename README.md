@@ -163,7 +163,11 @@ It is set to **None** by default.
 Note: close the browser fully before downloading. Chromium-based
 browsers lock their cookie database while running, and on Windows they
 additionally encrypt it with DPAPI, so cookie reads fail if the browser
-is open.
+is open. If that happens, MediaDownloader no longer blocks the whole
+action on it — analyzing, downloading, and resolving a live `.m3u8`
+manifest all automatically retry once without cookies and show a toast
+explaining what happened, instead of failing outright over an optional
+feature.
 
 ## Notes on the "original audio" and "live → .m3u8" features
 
@@ -197,6 +201,56 @@ Optional fields (`{playlist}`, `{playlist_index}`, `{quality}`,
 they don't apply, and path segments that collapse to nothing are
 dropped — so downloading a single video no longer creates a stray `NA`
 folder.
+
+## Download engine
+
+Downloads run through a direct, self-managed yt-dlp process rather than
+a third-party wrapper library, for two reasons that both turned out to
+matter in practice:
+
+- **Real progress.** A custom `--progress-template` prints one
+  unambiguous line per update, which this app parses itself — instead
+  of relying on a wrapper's regex match against yt-dlp's default
+  human-readable progress bar, which could silently produce no
+  progress events at all (a download would sit at 0% until it finished).
+- **A real Cancel/Pause.** Stopping a download kills the *whole*
+  process tree (`taskkill /t /f` on Windows), not just the yt-dlp
+  process itself. yt-dlp spawns ffmpeg as a child process for merging;
+  killing only the parent left that ffmpeg child running, so a
+  "cancelled" download kept writing the output file in the background.
+
+## Live videos
+
+Live broadcasts are served as HLS and almost always only expose
+already-muxed video+audio variants — there's usually no separate
+audio-only stream to pair with a video-only one. The normal
+`bestvideo+bestaudio` selector demanding that pairing is what produced
+"Requested format is not available" for live videos specifically; live
+downloads now use a simpler, merge-free selector instead.
+
+## Resuming after closing the app
+
+If downloads were still queued, downloading, or paused when the app
+last closed, it asks whether to resume them on the next launch. Under
+the hood: on quit, any in-progress yt-dlp process is stopped (so
+nothing keeps running orphaned in the background once the window and
+tray icon are gone) but its partial `.part` file is left on disk;
+resuming re-queues the same download to the same filename, and yt-dlp
+picks up from where it left off rather than starting over.
+
+## Right-click menus
+
+The URL field and every queue/history row have a native right-click
+menu (cut/copy/paste on the field; Copy Video Link — and Show in
+Folder / Open File / Copy File Path once one exists — on a row).
+
+## Clearing finished downloads
+
+"Clear completed" only removes successfully completed and cancelled
+entries. Failed downloads are left in place on purpose, since a failed
+download is something to retry or investigate, not routine cleanup —
+losing it on the next "clear" click would just discard the error
+message you needed to see.
 
 ## Titles showing in the wrong language
 

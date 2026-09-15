@@ -22,6 +22,14 @@
 
 * { box-sizing: border-box; }
 
+/* The browser's default [hidden]{display:none} rule loses to any
+   class on the same element that sets its own `display` (e.g.
+   `.item-list{display:flex}`), because author rules beat the UA
+   default regardless of specificity. That's what let "Nothing here
+   yet" stay visible even once the list had rows, and vice versa.
+   This makes `hidden` always win. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   height: 100%;

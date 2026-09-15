@@ -2,8 +2,10 @@
 
 const { ipcMain, shell, dialog, Notification } = require('electron');
 const fs = require('fs');
+const path = require('path');
 const { getLogger } = require('../utils/logger');
 const { runYtDlp } = require('../utils/ytdlpRunner');
+const { isCookieFailureMessage } = require('../core/DownloadManager');
 
 const log = getLogger();
 
@@ -34,18 +36,40 @@ function registerIpcHandlers({
     if (!provider) {
       throw new Error('Unsupported URL. MediaDownloader currently supports YouTube and Facebook links.');
     }
+
+    // Providers receive a runner that captures yt-dlp's stderr, so a
+    // failure reports what actually went wrong rather than just the
+    // command line that failed.
+    const run = (args) => runYtDlp(binaryManager.ytDlpPath, args, { timeoutMs: 180000 });
+    const settings = settingsStore.getAll();
+
     try {
-      // Providers receive a runner that captures yt-dlp's stderr, so a
-      // failure reports what actually went wrong rather than just the
-      // command line that failed.
-      const run = (args) => runYtDlp(binaryManager.ytDlpPath, args, { timeoutMs: 180000 });
-      return await provider.analyze(url, ytDlpWrap, {
-        settings: settingsStore.getAll(),
-        forcePlaylist,
-        run
-      });
+      return await provider.analyze(url, ytDlpWrap, { settings, forcePlaylist, run });
     } catch (err) {
       log.error(`Analyze failed for ${url}`, { message: err.message, stderr: err.stderr, args: err.args });
+
+      // A browser left open (or a permissions issue) can make reading
+      // its cookie database fail outright, which used to block
+      // analyzing ANY link whenever "Use sign-in from browser" was
+      // set — even public videos that never needed cookies. Retry
+      // once without cookies instead of hard-failing.
+      const isCookieFailure = isCookieFailureMessage(err.message || '');
+      if (isCookieFailure && settings.cookiesFromBrowser && settings.cookiesFromBrowser !== 'none') {
+        try {
+          const result = await provider.analyze(url, ytDlpWrap, {
+            settings: { ...settings, cookiesFromBrowser: 'none' },
+            forcePlaylist,
+            run
+          });
+          result.warning =
+            `Couldn't read cookies from ${settings.cookiesFromBrowser} (close it fully and retry if you need sign-in access) — analyzed as a public video instead.`;
+          return result;
+        } catch (retryErr) {
+          log.error(`Analyze retry without cookies failed for ${url}`, { message: retryErr.message });
+          throw new Error(humanizeAnalyzeError(retryErr));
+        }
+      }
+
       throw new Error(humanizeAnalyzeError(err));
     }
   });
@@ -93,8 +117,24 @@ function registerIpcHandlers({
     return result.filePaths[0];
   });
 
-  ipcMain.handle('shell:openPath', async (_evt, filePath) => shell.openPath(filePath));
-  ipcMain.handle('shell:showInFolder', async (_evt, filePath) => shell.showItemInFolder(filePath));
+  ipcMain.handle('shell:openPath', async (_evt, filePath) => {
+    if (!filePath || !fs.existsSync(filePath)) {
+      throw new Error(
+        `Couldn't find "${path.basename(filePath || '')}". It may have been moved, renamed, or deleted.`
+      );
+    }
+    const result = await shell.openPath(filePath);
+    if (result) throw new Error(result); // shell.openPath resolves with an error string on failure, not a rejection
+  });
+
+  ipcMain.handle('shell:showInFolder', async (_evt, filePath) => {
+    if (!filePath || !fs.existsSync(filePath)) {
+      throw new Error(
+        `Couldn't find "${path.basename(filePath || '')}". It may have been moved, renamed, or deleted.`
+      );
+    }
+    shell.showItemInFolder(filePath);
+  });
 
   ipcMain.handle('clipboard:read', async () => {
     // eslint-disable-next-line global-require
@@ -115,6 +155,50 @@ function registerIpcHandlers({
       { type: 'separator' },
       { role: 'selectAll' }
     ];
+    Menu.buildFromTemplate(template).popup({ window: win });
+  });
+
+  // Right-click menu for a queue/history row: copy the source link,
+  // and (once a file exists) copy its path / reveal it / open it.
+  ipcMain.handle('ui:showItemContextMenu', async (_evt, { url, filePath, hasFile }) => {
+    // eslint-disable-next-line global-require
+    const { Menu, clipboard } = require('electron');
+    const win = getWindow();
+    const template = [
+      {
+        label: 'Copy Video Link',
+        enabled: !!url,
+        click: () => clipboard.writeText(url || '')
+      }
+    ];
+    if (hasFile && filePath) {
+      const fileStillExists = fs.existsSync(filePath);
+      template.push(
+        { type: 'separator' },
+        { label: 'Copy File Path', click: () => clipboard.writeText(filePath) },
+        {
+          label: 'Show in Folder',
+          enabled: fileStillExists,
+          click: () => shell.showItemInFolder(filePath)
+        },
+        {
+          label: 'Open File',
+          enabled: fileStillExists,
+          click: async () => {
+            const result = await shell.openPath(filePath);
+            if (result) {
+              dialog.showErrorBox('Couldn\'t open file', result);
+            }
+          }
+        }
+      );
+      if (!fileStillExists) {
+        template.push({
+          label: 'File not found (moved or deleted)',
+          enabled: false
+        });
+      }
+    }
     Menu.buildFromTemplate(template).popup({ window: win });
   });
 

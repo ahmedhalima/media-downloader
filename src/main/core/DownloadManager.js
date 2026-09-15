@@ -8,9 +8,13 @@ const { EventEmitter } = require('events');
 const { v4: uuid } = require('uuid');
 const { getLogger } = require('../utils/logger');
 const { buildOutputPath } = require('../utils/filenameTemplate');
-const { runYtDlp } = require('../utils/ytdlpRunner');
+const { runYtDlp, spawnManaged, killProcessTree } = require('../utils/ytdlpRunner');
 
 const log = getLogger();
+
+// Marks our custom progress-template lines so they're unambiguous to
+// find in a stream of otherwise-human-readable yt-dlp output.
+const PROGRESS_MARK = 'MEDIADL_PROGRESS';
 
 const STATUS = Object.freeze({
   QUEUED: 'queued',
@@ -56,6 +60,45 @@ class DownloadManager extends EventEmitter {
     return runYtDlp(this.ytDlpPath, args, { timeoutMs: 120000 });
   }
 
+  /**
+   * Snapshot of not-yet-finished tasks, used to offer resuming them on
+   * the next launch. Deliberately excludes completed/error/canceled —
+   * only work that was still queued, downloading, or paused when the
+   * app closed is worth asking about again.
+   */
+  getResumableSnapshot() {
+    return Array.from(this.tasks.values())
+      .filter((t) => [STATUS.QUEUED, STATUS.DOWNLOADING, STATUS.PAUSED].includes(t.status))
+      .map((t) => ({
+        mode: t.mode === 'm3u8' ? 'm3u8' : 'video',
+        url: t.url,
+        provider: t.provider,
+        title: t.title,
+        thumbnail: t.thumbnail,
+        durationSeconds: t.durationSeconds,
+        qualityId: t.qualityId,
+        audioOnly: t.audioOnly,
+        isLive: t.isLive,
+        playlistIndex: t.playlistIndex,
+        playlistTitle: t.playlistTitle,
+        playlistTotal: t.playlistTotal
+      }));
+  }
+
+  /**
+   * Stops any in-flight yt-dlp process without touching history or
+   * deleting partial files (unlike `cancel`, which does both) — used
+   * only when the app itself is quitting, so a download that was mid-
+   * flight resumes cleanly next launch via yt-dlp's own `.part`/
+   * `--continue` handling instead of either restarting from scratch or
+   * continuing to run orphaned in the background after the window and
+   * tray icon are gone.
+   */
+  async killAllActiveForQuit() {
+    const downloading = Array.from(this.tasks.values()).filter((t) => t.status === STATUS.DOWNLOADING);
+    await Promise.all(downloading.map((t) => this._killProcess(t)));
+  }
+
   getAll() {
     return Array.from(this.tasks.values()).map(this._publicView);
   }
@@ -88,6 +131,7 @@ class DownloadManager extends EventEmitter {
       playlistIndex: input.playlistIndex || null,
       playlistTitle: input.playlistTitle || null,
       playlistTotal: input.playlistTotal || null,
+      isLive: !!input.isLive,
       status: STATUS.QUEUED,
       progressPercent: 0,
       speed: null,
@@ -234,56 +278,27 @@ class DownloadManager extends EventEmitter {
       return;
     }
 
+    const settings = this.settingsStore.getAll();
+    const wantsCookies = settings.cookiesFromBrowser && settings.cookiesFromBrowser !== 'none';
+
     try {
-      const settings = this.settingsStore.getAll();
-      const raw = await this.runYtDlp(
-        provider.buildManifestArgs(task.url, task.qualityId, settings)
-      );
-      const manifestUrl = raw
-        .split('\n')
-        .map((l) => l.trim())
-        .filter(Boolean)
-        .find((l) => l.startsWith('http'));
-
-      if (!manifestUrl) {
-        throw new Error('Could not resolve a live manifest URL for this video.');
-      }
-
-      task.progressPercent = 50;
-      this._emitUpdate(task);
-
-      const manifestText = await fetchText(manifestUrl);
-      if (!/^#EXTM3U/m.test(manifestText)) {
-        throw new Error('The resolved stream is not an HLS (.m3u8) manifest.');
-      }
-
-      // Sanity check: a master playlist that advertises video but
-      // declares no audio (no AUDIO= attribute and no audio media
-      // group) would play silently. Flag it rather than silently
-      // handing the user a mute stream.
-      const isMaster = /#EXT-X-STREAM-INF/.test(manifestText);
-      const hasAudio =
-        /TYPE=AUDIO/.test(manifestText) || /AUDIO="/.test(manifestText) || !isMaster;
-      if (!hasAudio) {
-        task.warning = 'This manifest contains no audio track.';
-      }
-
-      const downloadRoot = settings.organizeByProvider
-        ? path.join(settings.downloadFolder, capitalize(provider.id), 'Live')
-        : path.join(settings.downloadFolder, 'Live');
-      fs.mkdirSync(downloadRoot, { recursive: true });
-
-      const safeTitle = sanitizeFilename(task.title) || task.id;
-      const filePath = path.join(downloadRoot, `${safeTitle}.m3u8`);
-      fs.writeFileSync(filePath, manifestText, 'utf8');
-
-      task.filePath = filePath;
-      task.progressPercent = 100;
-      task.status = STATUS.COMPLETED;
-      this._emitUpdate(task);
-      this._recordHistory(task, provider);
-      this.emit('task:completed', this._publicView(task));
+      await this._resolveAndSaveManifest(task, provider, settings);
     } catch (err) {
+      if (isCookieFailureMessage(err.message) && wantsCookies) {
+        task.warning = `Couldn't read cookies from ${settings.cookiesFromBrowser} (close it completely, then retry, if you need sign-in access) — continuing as a public stream.`;
+        this._emitUpdate(task);
+        try {
+          await this._resolveAndSaveManifest(task, provider, { ...settings, cookiesFromBrowser: 'none' });
+          return;
+        } catch (retryErr) {
+          log.error(`Live manifest retry without cookies failed for ${task.url}`, retryErr);
+          task.status = STATUS.ERROR;
+          task.error = humanizeError(retryErr);
+          this._emitUpdate(task);
+          this.emit('task:error', this._publicView(task));
+          return;
+        }
+      }
       log.error(`Live manifest download failed for ${task.url}`, err);
       task.status = STATUS.ERROR;
       task.error = humanizeError(err);
@@ -292,9 +307,84 @@ class DownloadManager extends EventEmitter {
     }
   }
 
+  async _resolveAndSaveManifest(task, provider, settings) {
+    const raw = await this.runYtDlp(provider.buildManifestArgs(task.url, task.qualityId, settings));
+    const manifestUrl = raw
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .find((l) => l.startsWith('http'));
+
+    if (!manifestUrl) {
+      throw new Error('Could not resolve a live manifest URL for this video.');
+    }
+
+    task.progressPercent = 50;
+    this._emitUpdate(task);
+
+    const manifestText = await fetchText(manifestUrl);
+    if (!/^#EXTM3U/m.test(manifestText)) {
+      throw new Error('The resolved stream is not an HLS (.m3u8) manifest.');
+    }
+
+    // Sanity check: a master playlist that advertises video but
+    // declares no audio (no AUDIO= attribute and no audio media
+    // group) would play silently. Flag it rather than silently
+    // handing the user a mute stream.
+    const isMaster = /#EXT-X-STREAM-INF/.test(manifestText);
+    const hasAudio = /TYPE=AUDIO/.test(manifestText) || /AUDIO="/.test(manifestText) || !isMaster;
+    if (!hasAudio) {
+      task.warning = task.warning || 'This manifest contains no audio track.';
+    }
+
+    const downloadRoot = settings.organizeByProvider
+      ? path.join(settings.downloadFolder, capitalize(provider.id), 'Live')
+      : path.join(settings.downloadFolder, 'Live');
+    fs.mkdirSync(downloadRoot, { recursive: true });
+
+    const safeTitle = sanitizeFilename(task.title) || task.id;
+    const filePath = path.join(downloadRoot, `${safeTitle}.m3u8`);
+    fs.writeFileSync(filePath, manifestText, 'utf8');
+
+    task.filePath = filePath;
+    task.progressPercent = 100;
+    task.status = STATUS.COMPLETED;
+    this._emitUpdate(task);
+    this._recordHistory(task, provider);
+    this.emit('task:completed', this._publicView(task));
+  }
+
   async _start(task) {
+    const settings = this.settingsStore.getAll();
+    const wantsCookies = settings.cookiesFromBrowser && settings.cookiesFromBrowser !== 'none';
+
+    const result = await this._attemptDownload(task, settings);
+
+    // A browser left open (or locked by another process) makes yt-dlp's
+    // own cookie-database copy fail outright — this is a well-known
+    // yt-dlp limitation (github.com/yt-dlp/yt-dlp/issues/7271), not
+    // something retrying the same command fixes. Retrying once with
+    // cookies turned off lets the download proceed as a public one
+    // instead of failing completely over an optional feature.
+    if (result === 'cookie-failure' && wantsCookies) {
+      task.warning = `Couldn't read cookies from ${settings.cookiesFromBrowser} (close it completely, then retry, if you need sign-in access) — continuing as a public download.`;
+      this._emitUpdate(task);
+      await this._attemptDownload(task, { ...settings, cookiesFromBrowser: 'none' });
+    }
+  }
+
+  /**
+   * Runs exactly one yt-dlp download attempt for a task. Returns
+   * 'cookie-failure' if it failed specifically because of an unreadable
+   * browser cookie database (so `_start` can decide whether to retry),
+   * or 'done' for any other outcome — success, a normal error, or the
+   * task having been paused/cancelled mid-flight (both already handled
+   * and reflected on the task itself).
+   */
+  async _attemptDownload(task, settings) {
     task.status = STATUS.DOWNLOADING;
     task.error = null;
+    task.rawError = null;
     this._emitUpdate(task);
 
     const provider = this.providerManager.resolve(task.url);
@@ -302,10 +392,9 @@ class DownloadManager extends EventEmitter {
       task.status = STATUS.ERROR;
       task.error = 'No provider can handle this URL';
       this._emitUpdate(task);
-      return;
+      return 'done';
     }
 
-    const settings = this.settingsStore.getAll();
     const downloadRoot = settings.organizeByProvider
       ? path.join(settings.downloadFolder, capitalize(provider.id))
       : settings.downloadFolder;
@@ -319,7 +408,9 @@ class DownloadManager extends EventEmitter {
       buildOutputPath(downloadRoot, settings.filenameTemplate),
       task
     );
-    const formatSelector = provider.buildFormatSelector(task.qualityId, task.audioOnly);
+    const formatSelector = provider.buildFormatSelector(task.qualityId, task.audioOnly, {
+      isLive: task.isLive
+    });
 
     const args = [
       task.url,
@@ -335,88 +426,175 @@ class DownloadManager extends EventEmitter {
       // Ensures the "NA" placeholder never reaches a path segment even
       // if a template field resolves to nothing.
       '--output-na-placeholder', '',
+      // A custom, unambiguous progress line we parse ourselves below,
+      // instead of relying on a third-party library's regex against
+      // yt-dlp's default human-readable progress bar (which is what
+      // silently produced no progress updates at all).
+      '--progress-template', `download:${PROGRESS_MARK}|%(progress.status)s|%(progress.percent)s|%(progress.downloaded_bytes)s|%(progress.total_bytes,progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s`,
       '--print', 'after_move:MEDIADL_FILEPATH:%(filepath)s',
       ...(task.audioOnly ? ['-x', '--audio-format', settings.preferredAudioFormat] : []),
-      ...(!task.audioOnly ? ['--merge-output-format', 'mp4'] : []),
+      ...(!task.audioOnly && !task.isLive ? ['--merge-output-format', 'mp4'] : []),
       ...provider.extraArgs(settings)
     ];
     task.ytArgs = args;
 
     return new Promise((resolve) => {
       let settled = false;
-      const finish = () => {
+      const finish = (outcome) => {
         if (!settled) {
           settled = true;
-          resolve();
+          resolve(outcome);
         }
       };
 
+      let child;
       try {
-        const emitter = this.ytDlpWrap.exec(args);
-        task.process = emitter;
-
-        emitter.on('progress', (p) => {
-          if (task.status !== STATUS.DOWNLOADING) return;
-          task.progressPercent = clamp(p.percent, 0, 100);
-          task.speed = p.currentSpeed || null;
-          task.eta = p.eta || null;
-          task.totalSizeText = p.totalSize || null;
-          this._emitUpdate(task);
-        });
-
-        emitter.on('ytDlpEvent', (eventType, eventData) => {
-          if (typeof eventData === 'string' && eventData.includes('MEDIADL_FILEPATH:')) {
-            task.filePath = eventData.split('MEDIADL_FILEPATH:')[1].trim();
-          }
-          // Keep the most recent real yt-dlp error line around so a
-          // failure reports what actually went wrong rather than just
-          // an exit code.
-          if (typeof eventData === 'string' && /^ERROR[:\s]/i.test(eventData.trim())) {
-            task.rawError = eventData.trim();
-          }
-        });
-
-        emitter.on('error', (err) => {
-          log.error(`Download error for ${task.url}`, err);
-          if (task.status === STATUS.PAUSED || task.status === STATUS.CANCELED) {
-            // Expected: we killed the process ourselves.
-            finish();
-            return;
-          }
-          task.status = STATUS.ERROR;
-          task.error = humanizeError(err);
-          this._emitUpdate(task);
-          this.emit('task:error', this._publicView(task));
-          finish();
-        });
-
-        emitter.on('close', (code) => {
-          if (task.status === STATUS.PAUSED || task.status === STATUS.CANCELED) {
-            finish();
-            return;
-          }
-          if (code === 0 || code === null) {
-            task.status = STATUS.COMPLETED;
-            task.progressPercent = 100;
-            this._emitUpdate(task);
-            this._recordHistory(task, provider);
-            this.emit('task:completed', this._publicView(task));
-          } else if (task.status !== STATUS.COMPLETED) {
-            task.status = STATUS.ERROR;
-            task.error =
-              task.error || (task.rawError ? humanizeError(new Error(task.rawError)) : `yt-dlp exited with code ${code}`);
-            this._emitUpdate(task);
-            this.emit('task:error', this._publicView(task));
-          }
-          finish();
-        });
+        child = spawnManaged(this.ytDlpPath, args);
       } catch (err) {
         task.status = STATUS.ERROR;
         task.error = humanizeError(err);
         this._emitUpdate(task);
-        finish();
+        finish('done');
+        return;
       }
+
+      task.pid = child.pid;
+      task.process = child; // internal only — stripped by _publicView
+
+      let stdoutBuf = '';
+      child.stdout.on('data', (chunk) => {
+        stdoutBuf += chunk.toString();
+        const lines = stdoutBuf.split(/\r?\n/);
+        stdoutBuf = lines.pop(); // keep the trailing partial line for next chunk
+        for (const line of lines) this._handleDownloadLine(task, line);
+      });
+
+      let stderrBuf = '';
+      child.stderr.on('data', (chunk) => {
+        stderrBuf += chunk.toString();
+        const lines = stderrBuf.split(/\r?\n/);
+        stderrBuf = lines.pop();
+        for (const line of lines) {
+          const trimmed = line.trim();
+          // Keep the most recent real yt-dlp error line so a failure
+          // reports what actually went wrong rather than just an exit
+          // code.
+          if (/^ERROR[:\s]/i.test(trimmed)) task.rawError = trimmed;
+        }
+      });
+
+      child.on('error', (err) => {
+        log.error(`Download error for ${task.url}`, err);
+        task.process = null;
+        task.pid = null;
+        if (task.status === STATUS.PAUSED || task.status === STATUS.CANCELED) {
+          finish('done');
+          return;
+        }
+        task.status = STATUS.ERROR;
+        task.error = humanizeError(err);
+        this._emitUpdate(task);
+        this.emit('task:error', this._publicView(task));
+        finish('done');
+      });
+
+      child.on('close', (code) => {
+        task.process = null;
+        task.pid = null;
+
+        if (task.status === STATUS.PAUSED || task.status === STATUS.CANCELED) {
+          finish('done');
+          return;
+        }
+        if (code === 0) {
+          task.status = STATUS.COMPLETED;
+          task.progressPercent = 100;
+          this._emitUpdate(task);
+          this._recordHistory(task, provider);
+          this.emit('task:completed', this._publicView(task));
+          finish('done');
+          return;
+        }
+
+        // yt-dlp can fail late — e.g. a browser-cookie read for an
+        // unrelated post-step — AFTER the video itself already
+        // finished downloading and was moved to its final filename.
+        // Retrying from scratch in that case just re-downloads a
+        // video that's already complete, wastes bandwidth, and is
+        // what made a cookie error still appear even though the
+        // video had, in fact, already downloaded successfully.
+        if (task.filePath && fs.existsSync(task.filePath)) {
+          task.status = STATUS.COMPLETED;
+          task.progressPercent = 100;
+          if (isCookieFailureMessage(task.rawError)) {
+            task.warning =
+              task.warning ||
+              'The video downloaded successfully. A browser sign-in step failed afterward and was skipped — turn off "Use sign-in from browser" in Settings if you don\'t need it.';
+          }
+          this._emitUpdate(task);
+          this._recordHistory(task, provider);
+          this.emit('task:completed', this._publicView(task));
+          finish('done');
+          return;
+        }
+
+        if (isCookieFailureMessage(task.rawError)) {
+          finish('cookie-failure');
+          return;
+        }
+
+        if (task.status !== STATUS.COMPLETED) {
+          task.status = STATUS.ERROR;
+          task.error =
+            task.error || (task.rawError ? humanizeError(new Error(task.rawError)) : `yt-dlp exited with code ${code}`);
+          this._emitUpdate(task);
+          this.emit('task:error', this._publicView(task));
+        }
+        finish('done');
+      });
     });
+  }
+
+  /** Parses one line of stdout from a running download. */
+  _handleDownloadLine(task, rawLine) {
+    const line = rawLine.trim();
+    if (!line) return;
+
+    if (line.startsWith('MEDIADL_FILEPATH:')) {
+      task.filePath = line.slice('MEDIADL_FILEPATH:'.length).trim();
+      return;
+    }
+
+    if (line.startsWith(PROGRESS_MARK)) {
+      if (task.status !== STATUS.DOWNLOADING) return;
+      const [, , percentRaw, downloadedRaw, totalRaw, speedRaw, etaRaw] = line.split('|');
+
+      const percent = parseFloat(percentRaw);
+      const downloaded = parseFloat(downloadedRaw);
+      const total = parseFloat(totalRaw);
+
+      if (!Number.isNaN(total) && total > 0) {
+        task.totalSizeText = formatBytes(total);
+        task.progressPercent = !Number.isNaN(downloaded)
+          ? clamp((downloaded / total) * 100, 0, 100)
+          : clamp(percent, 0, 100);
+      } else if (!Number.isNaN(percent)) {
+        task.progressPercent = clamp(percent, 0, 100);
+      }
+
+      const speed = parseFloat(speedRaw);
+      if (!Number.isNaN(speed) && speed > 0) task.speed = `${formatBytes(speed)}/s`;
+
+      const eta = parseFloat(etaRaw);
+      if (!Number.isNaN(eta) && eta >= 0) task.eta = formatEta(eta);
+
+      this._emitUpdate(task);
+      return;
+    }
+
+    if (/^ERROR[:\s]/i.test(line)) {
+      task.rawError = line;
+    }
   }
 
   _recordHistory(task, provider) {
@@ -441,14 +619,18 @@ class DownloadManager extends EventEmitter {
     });
   }
 
-  pause(id) {
+  async pause(id) {
     const task = this.tasks.get(id);
     if (!task || task.status !== STATUS.DOWNLOADING) return this._publicView(task);
     task.status = STATUS.PAUSED;
-    this._killProcess(task);
+    await this._killProcess(task);
     this._emitUpdate(task);
-    this.activeCount = Math.max(0, this.activeCount - 1);
-    this._tryStartNext();
+    // Do not touch activeCount/_tryStartNext here: the still-pending
+    // _start() promise for this task resolves once the killed
+    // process's 'close' event fires, and _tryStartNext's own
+    // .finally() decrements activeCount and looks for the next queued
+    // item at that point. Doing it here too double-decremented the
+    // count, letting more downloads run than the configured limit.
     return this._publicView(task);
   }
 
@@ -461,17 +643,14 @@ class DownloadManager extends EventEmitter {
     return this._publicView(task);
   }
 
-  cancel(id) {
+  async cancel(id) {
     const task = this.tasks.get(id);
     if (!task) return null;
-    const wasActive = task.status === STATUS.DOWNLOADING;
     task.status = STATUS.CANCELED;
-    this._killProcess(task);
+    await this._killProcess(task);
     this._emitUpdate(task);
-    if (wasActive) {
-      this.activeCount = Math.max(0, this.activeCount - 1);
-      this._tryStartNext();
-    }
+    // See the comment in pause() — activeCount is freed exclusively by
+    // _tryStartNext's .finally() once _start()'s promise resolves.
     if (this.settingsStore.get('deletePartialOnCancel')) {
       this._cleanupPartialFiles(task);
     }
@@ -495,24 +674,33 @@ class DownloadManager extends EventEmitter {
     return this._publicView(task);
   }
 
-  remove(id) {
+  async remove(id) {
     const task = this.tasks.get(id);
-    if (task && task.status === STATUS.DOWNLOADING) this.cancel(id);
+    if (task && task.status === STATUS.DOWNLOADING) await this.cancel(id);
     this.tasks.delete(id);
     this.emit('task:removed', id);
   }
 
-  _killProcess(task) {
-    try {
-      if (task.process && task.process.ytDlpProcess && !task.process.ytDlpProcess.killed) {
-        task.process.ytDlpProcess.kill();
-      } else if (task.process && typeof task.process.abort === 'function') {
-        task.process.abort();
+  /**
+   * Kills the yt-dlp process AND any children it spawned (chiefly
+   * ffmpeg, used for merging/remuxing). Previously this only called
+   * `.kill()` on the immediate process via a property yt-dlp-wrap may
+   * or may not have actually exposed — killing just that process left
+   * ffmpeg running, so a "cancelled" download kept writing the output
+   * file in the background. killProcessTree uses `taskkill /t` on
+   * Windows (and a process-group kill elsewhere) to take down the
+   * whole tree.
+   */
+  async _killProcess(task) {
+    if (task.pid) {
+      try {
+        await killProcessTree(task.pid);
+      } catch (err) {
+        log.warn(`Failed to kill process tree for task ${task.id}`, err);
       }
-    } catch (err) {
-      log.warn(`Failed to kill process for task ${task.id}`, err);
     }
     task.process = null;
+    task.pid = null;
   }
 
   _cleanupPartialFiles(task) {
@@ -623,8 +811,46 @@ function clamp(n, min, max) {
   return Math.min(max, Math.max(min, num));
 }
 
+/** Formats a raw byte count as e.g. "12.4 MB". */
+function formatBytes(bytes) {
+  if (!bytes || bytes <= 0) return null;
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let i = 0;
+  while (value >= 1024 && i < units.length - 1) {
+    value /= 1024;
+    i += 1;
+  }
+  return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[i]}`;
+}
+
+/** Formats a raw seconds count as e.g. "1:05" or "12s". */
+function formatEta(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  if (m < 60) return `${m}:${String(rem).padStart(2, '0')}`;
+  const h = Math.floor(m / 60);
+  return `${h}:${String(m % 60).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
+}
+
 function capitalize(s) {
   return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/**
+ * Matches yt-dlp's cookie-database-read failures, including the exact
+ * "Could not copy X cookie database" message from
+ * github.com/yt-dlp/yt-dlp/issues/7271 (typically because the browser
+ * is currently running and has the file locked), as well as related
+ * DPAPI/permission variants.
+ */
+function isCookieFailureMessage(msg) {
+  if (!msg) return false;
+  return /could not copy .*cookie|could not find .*cookies|unable to open cookie|cookie database|DPAPI|Permission denied.*[Cc]ookies/i.test(
+    msg
+  );
 }
 
 function humanizeError(err) {
@@ -636,8 +862,8 @@ function humanizeError(err) {
   if (/Private video|login required|Sign in to confirm/i.test(msg)) {
     return 'This content is private or requires sign-in. If your own account can view it, enable "Use sign-in from browser" in Settings.';
   }
-  if (/could not find .* cookies|unable to open cookie|DPAPI|Permission denied.*[Cc]ookies/i.test(msg)) {
-    return 'Could not read cookies from the selected browser. Close the browser fully and try again, or set it back to "None" in Settings.';
+  if (isCookieFailureMessage(msg)) {
+    return 'Could not read cookies from the selected browser (it may be running — close it fully and try again), or set "Use sign-in from browser" back to "None" in Settings.';
   }
   if (/Video unavailable/i.test(msg)) return 'This video is unavailable.';
   if (/is not a valid URL|Unsupported URL/i.test(msg)) return 'That link is not a supported video URL.';
@@ -651,4 +877,4 @@ function humanizeError(err) {
     .slice(0, 300);
 }
 
-module.exports = { DownloadManager, STATUS };
+module.exports = { DownloadManager, STATUS, isCookieFailureMessage };

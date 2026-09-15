@@ -19,7 +19,8 @@ const state = {
   history: [],
   settings: null,
   clipboardTimer: null,
-  lastClipboardValue: ''
+  lastClipboardValue: '',
+  shownWarnings: new Set()
 };
 
 let localIdCounter = 0;
@@ -111,6 +112,7 @@ async function analyzeAndAdd(url, opts = {}) {
   pasteLinkBtn.disabled = true;
   try {
     const result = await api.analyzeUrl(url, { forcePlaylist: !!opts.forcePlaylist });
+    if (result.warning) toast(result.warning);
     state.pending.set(localId, {
       localId,
       status: 'ready',
@@ -197,7 +199,8 @@ async function confirmPending(localId, opts = {}) {
         thumbnail: a.thumbnail,
         durationSeconds: a.durationSeconds,
         qualityId,
-        audioOnly
+        audioOnly,
+        isLive: !!a.isLive
       };
       const res = await api.enqueueDownload(payload);
       if (res && res.duplicate) {
@@ -272,6 +275,11 @@ function chip(label, cls) {
 
 function iconBtn(glyph, title, handler) {
   return el('button', { class: 'icon-btn', title, onclick: handler }, glyph);
+}
+
+/** Wraps an openPath/showInFolder call so a missing/moved file surfaces as a toast instead of silently doing nothing. */
+function safeFileAction(promise) {
+  Promise.resolve(promise).catch((err) => toast(err.message || String(err), 'error'));
 }
 
 /* ----- Pending row ----- */
@@ -456,8 +464,8 @@ function renderTaskRow(t) {
   if (t.status === 'paused') actions.appendChild(iconBtn('▶', 'Resume', () => api.resumeDownload(t.id)));
   if (t.status === 'error') actions.appendChild(iconBtn('↻', 'Retry', () => api.retryDownload(t.id)));
   if (t.status === 'completed' && t.filePath) {
-    actions.appendChild(iconBtn('⤢', 'Show in folder', () => api.showInFolder(t.filePath)));
-    actions.appendChild(iconBtn('▶', 'Open file', () => api.openPath(t.filePath)));
+    actions.appendChild(iconBtn('⤢', 'Show in folder', () => safeFileAction(api.showInFolder(t.filePath))));
+    actions.appendChild(iconBtn('▶', 'Open file', () => safeFileAction(api.openPath(t.filePath))));
   }
   if (['downloading', 'queued', 'paused'].includes(t.status)) {
     actions.appendChild(iconBtn('✕', 'Cancel', () => api.cancelDownload(t.id)));
@@ -465,7 +473,18 @@ function renderTaskRow(t) {
     actions.appendChild(iconBtn('🗑', 'Remove from list', () => api.removeDownload(t.id)));
   }
 
-  return el('li', { class: 'item-row', dataset: { status: t.status } }, [thumbNode(t.thumbnail), main, actions]);
+  return el(
+    'li',
+    {
+      class: 'item-row',
+      dataset: { status: t.status },
+      oncontextmenu: (e) => {
+        e.preventDefault();
+        api.showItemContextMenu({ url: t.url, filePath: t.filePath, hasFile: t.status === 'completed' && !!t.filePath });
+      }
+    },
+    [thumbNode(t.thumbnail), main, actions]
+  );
 }
 
 /* ----- History row ----- */
@@ -479,8 +498,8 @@ function renderHistoryRow(h) {
   const actions = el('div', { class: 'item-actions' }, [
     ...(h.filePath
       ? [
-          iconBtn('⤢', 'Show in folder', () => api.showInFolder(h.filePath)),
-          iconBtn('▶', 'Open file', () => api.openPath(h.filePath))
+          iconBtn('⤢', 'Show in folder', () => safeFileAction(api.showInFolder(h.filePath))),
+          iconBtn('▶', 'Open file', () => safeFileAction(api.openPath(h.filePath)))
         ]
       : []),
     iconBtn('🗑', 'Delete from history', async () => {
@@ -491,11 +510,18 @@ function renderHistoryRow(h) {
     })
   ]);
 
-  return el('li', { class: 'item-row', dataset: { status: 'completed' } }, [
-    thumbNode(h.thumbnail),
-    el('div', { class: 'item-main' }, [el('div', { class: 'item-title' }, h.title), sub]),
-    actions
-  ]);
+  return el(
+    'li',
+    {
+      class: 'item-row',
+      dataset: { status: 'completed' },
+      oncontextmenu: (e) => {
+        e.preventDefault();
+        api.showItemContextMenu({ url: h.url, filePath: h.filePath, hasFile: !!h.filePath });
+      }
+    },
+    [thumbNode(h.thumbnail), el('div', { class: 'item-main' }, [el('div', { class: 'item-title' }, h.title), sub]), actions]
+  );
 }
 
 async function refreshHistory() {
@@ -543,15 +569,18 @@ document.getElementById('clearHistoryBtn').addEventListener('click', clearAllHis
 document.getElementById('clearHistorySettingsBtn').addEventListener('click', clearAllHistory);
 
 document.getElementById('clearCompletedBtn').addEventListener('click', async () => {
-  const done = Array.from(state.tasks.values()).filter((t) =>
-    ['completed', 'error', 'canceled'].includes(t.status)
-  );
+  const done = Array.from(state.tasks.values()).filter((t) => ['completed', 'canceled'].includes(t.status));
+  const failedCount = Array.from(state.tasks.values()).filter((t) => t.status === 'error').length;
   if (!done.length) {
-    toast('No finished items to clear.');
+    toast(failedCount ? `No finished items to clear (${failedCount} failed item${failedCount === 1 ? '' : 's'} kept).` : 'No finished items to clear.');
     return;
   }
   for (const t of done) await api.removeDownload(t.id);
-  toast(`Cleared ${done.length} item${done.length === 1 ? '' : 's'}.`, 'success');
+  toast(
+    `Cleared ${done.length} item${done.length === 1 ? '' : 's'}.` +
+      (failedCount ? ` Kept ${failedCount} failed item${failedCount === 1 ? '' : 's'}.` : ''),
+    'success'
+  );
 });
 
 /* ---------------- Clipboard auto-detect ---------------- */
@@ -662,6 +691,10 @@ document.getElementById('resetSettingsBtn').addEventListener('click', async () =
 /* ---------------- Events from main ---------------- */
 api.onDownloadUpdate(async (task) => {
   state.tasks.set(task.id, task);
+  if (task.warning && !state.shownWarnings.has(task.warning)) {
+    state.shownWarnings.add(task.warning);
+    toast(task.warning);
+  }
   if (task.status === 'completed') {
     await refreshHistory();
     updateHistoryCount();

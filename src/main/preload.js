@@ -5,6 +5,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('mediaDownloader', {
   analyzeUrl: (url, options = {}) => ipcRenderer.invoke('urls:analyze', { url, ...options }),
   showInputContextMenu: (info) => ipcRenderer.invoke('ui:showInputContextMenu', info),
+  showItemContextMenu: (info) => ipcRenderer.invoke('ui:showItemContextMenu', info),
 
   enqueueDownload: (payload) => ipcRenderer.invoke('downloads:enqueue', payload),
   enqueuePlaylist: (entries, shared) => ipcRenderer.invoke('downloads:enqueuePlaylist', { entries, shared }),

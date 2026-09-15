@@ -17,6 +17,7 @@ process.env.PYTHONIOENCODING = 'utf-8';
 const { getLogger } = require('./utils/logger');
 const { SettingsStore } = require('./core/SettingsStore');
 const { HistoryStore } = require('./core/HistoryStore');
+const { QueueStore } = require('./core/QueueStore');
 const { BinaryManager } = require('./core/BinaryManager');
 const { ProviderManager } = require('./core/ProviderManager');
 const { DownloadManager } = require('./core/DownloadManager');
@@ -26,6 +27,9 @@ const { registerIpcHandlers } = require('./ipc/handlers');
 let mainWindow = null;
 let tray = null;
 let log = null;
+let downloadManagerRef = null;
+let queueStoreRef = null;
+let quitCleanupDone = false;
 
 /**
  * Electron installs a generic default menu (Help -> "Learn More",
@@ -104,6 +108,44 @@ function buildApplicationMenu({ getWindow, settingsStore }) {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
+/**
+ * If downloads were left unfinished when the app last closed, ask the
+ * user whether to pick them back up. Re-enqueuing uses the same
+ * output filename as before, so yt-dlp resumes the existing `.part`
+ * file rather than starting over.
+ */
+async function offerToResumePendingDownloads({ getWindow, downloadManager, queueStore, log }) {
+  const pending = queueStore.load();
+  if (!pending.length) return;
+
+  const win = getWindow();
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'question',
+    title: 'Resume downloads?',
+    message: `You have ${pending.length} unfinished download${pending.length === 1 ? '' : 's'} from last time.`,
+    detail: 'Resume them now, or discard and start fresh?',
+    buttons: ['Resume', 'Discard'],
+    defaultId: 0,
+    cancelId: 1
+  });
+
+  queueStore.clear();
+
+  if (response !== 0) return;
+
+  for (const item of pending) {
+    try {
+      if (item.mode === 'm3u8') {
+        downloadManager.enqueueLiveManifest(item);
+      } else {
+        downloadManager.enqueue({ ...item, allowDuplicate: true });
+      }
+    } catch (err) {
+      log.warn(`Failed to re-queue resumed item: ${item.url}`, err);
+    }
+  }
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1180,
@@ -153,6 +195,7 @@ async function bootstrap() {
 
   const settingsStore = new SettingsStore();
   const historyStore = new HistoryStore();
+  const queueStore = new QueueStore();
   const providerManager = new ProviderManager();
   const binaryManager = new BinaryManager();
 
@@ -179,6 +222,8 @@ async function bootstrap() {
     historyStore,
     providerManager
   });
+  downloadManagerRef = downloadManager;
+  queueStoreRef = queueStore;
 
   registerIpcHandlers({
     ytDlpWrap,
@@ -198,6 +243,8 @@ async function bootstrap() {
     downloadManager
   });
   tray = trayManager.init();
+
+  await offerToResumePendingDownloads({ getWindow: () => mainWindow, downloadManager, queueStore, log });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -233,8 +280,29 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
   app.isQuitting = true;
+  if (quitCleanupDone || !downloadManagerRef || !queueStoreRef) return;
+
+  // Save whatever was still queued/downloading/paused so it can be
+  // offered back on the next launch, then stop any running yt-dlp
+  // process (and the ffmpeg it may have spawned) so nothing keeps
+  // downloading in the background after the app has closed. Partial
+  // files are intentionally left on disk — that's what lets the
+  // resumed download continue instead of restarting from zero.
+  queueStoreRef.save(downloadManagerRef.getResumableSnapshot());
+
+  const stillDownloading = downloadManagerRef.getAll().some((t) => t.status === 'downloading');
+  if (!stillDownloading) return;
+
+  event.preventDefault();
+  downloadManagerRef
+    .killAllActiveForQuit()
+    .catch(() => {})
+    .finally(() => {
+      quitCleanupDone = true;
+      app.quit();
+    });
 });
 
 bootstrap().catch((err) => {

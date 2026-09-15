@@ -141,15 +141,24 @@ class YouTubeProvider extends BaseProvider {
     };
   }
 
-  buildFormatSelector(qualityId, audioOnly) {
+  buildFormatSelector(qualityId, audioOnly, { isLive = false } = {}) {
     if (audioOnly) {
       return 'bestaudio/best';
     }
-    if (!qualityId || qualityId === 'best') {
-      return 'bestvideo*+bestaudio/best';
+
+    const height = qualityId && qualityId !== 'best' ? parseInt(qualityId, 10) : null;
+
+    if (isLive) {
+      // Live broadcasts are served as HLS and almost always only
+      // expose already-muxed video+audio variants — there is usually
+      // no separate audio-only stream to pair with `bestvideo`.
+      // Demanding a bestvideo+bestaudio merge here is exactly what
+      // produced "Requested format is not available" for live
+      // videos, so live downloads use a merge-free selector instead.
+      return height && !Number.isNaN(height) ? `best[height<=${height}]/best` : 'best';
     }
-    const height = parseInt(qualityId, 10);
-    if (Number.isNaN(height)) return 'bestvideo*+bestaudio/best';
+
+    if (!height || Number.isNaN(height)) return 'bestvideo*+bestaudio/best';
 
     // Fallback chain, widest-to-narrowest. The trailing bare `best`
     // prevents "Requested format is not available" when a video has

@@ -38,9 +38,13 @@ class BaseProvider {
    * Returns the yt-dlp format-selector string for a requested quality.
    * Implementations must end their selector chain with a permissive
    * fallback so a request never dies with "Requested format is not
-   * available" when an exact match is missing.
+   * available" when an exact match is missing. `opts.isLive` lets a
+   * provider use a simpler, merge-free selector for live streams,
+   * which almost always only expose already-muxed HLS variants —
+   * demanding a separate bestvideo+bestaudio pair for those is what
+   * causes live downloads to fail with that exact error.
    */
-  buildFormatSelector(_qualityId, _audioOnly) {
+  buildFormatSelector(_qualityId, _audioOnly, _opts = {}) {
     throw new Error('Provider must implement buildFormatSelector');
   }
 

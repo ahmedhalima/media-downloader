@@ -1,6 +1,6 @@
 'use strict';
 
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
 
 /**
  * Runs yt-dlp directly and captures BOTH stdout and stderr.
@@ -24,11 +24,7 @@ function runYtDlp(binaryPath, args, { timeoutMs = 120000 } = {}) {
     const timer = setTimeout(() => {
       if (finished) return;
       finished = true;
-      try {
-        child.kill();
-      } catch (_) {
-        /* already gone */
-      }
+      killProcessTree(child.pid);
       reject(buildError('Timed out waiting for yt-dlp.', args, stderr, stdout));
     }, timeoutMs);
 
@@ -60,6 +56,55 @@ function runYtDlp(binaryPath, args, { timeoutMs = 120000 } = {}) {
   });
 }
 
+/**
+ * Spawns yt-dlp as a long-running, event-driven process for downloads,
+ * where the caller needs to react to stdout/stderr as it streams in
+ * (for live progress) rather than wait for a single resolved promise.
+ *
+ * On POSIX the child becomes its own process group leader (`detached:
+ * true`) so `killProcessTree` can kill the whole group at once — this
+ * matters because yt-dlp spawns ffmpeg as a child of its own process
+ * for merging/remuxing, and killing only the yt-dlp process leaves
+ * that ffmpeg child running (which is exactly what caused cancelled
+ * downloads to keep going in the background).
+ */
+function spawnManaged(binaryPath, args) {
+  return spawn(binaryPath, args, {
+    windowsHide: true,
+    detached: process.platform !== 'win32',
+    env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' }
+  });
+}
+
+/**
+ * Kills a spawned yt-dlp process AND any children it spawned (chiefly
+ * ffmpeg). A plain `child.kill()` only signals the immediate process;
+ * on Windows especially, a child's children are not automatically
+ * terminated when it dies, so ffmpeg would keep merging/downloading
+ * in the background after "Cancel" was clicked.
+ */
+function killProcessTree(pid) {
+  if (!pid) return Promise.resolve();
+  return new Promise((resolve) => {
+    if (process.platform === 'win32') {
+      // /T = kill the whole tree, /F = force. Errors are expected and
+      // ignored if the process already exited on its own.
+      execFile('taskkill', ['/pid', String(pid), '/t', '/f'], () => resolve());
+    } else {
+      try {
+        process.kill(-pid, 'SIGKILL'); // negative pid = whole process group
+      } catch (_) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch (_) {
+          /* already gone */
+        }
+      }
+      resolve();
+    }
+  });
+}
+
 function buildError(summary, args, stderr, stdout) {
   // Prefer yt-dlp's own ERROR: line; it is the useful part.
   const errorLine = String(stderr || '')
@@ -78,4 +123,4 @@ function buildError(summary, args, stderr, stdout) {
   return err;
 }
 
-module.exports = { runYtDlp };
+module.exports = { runYtDlp, spawnManaged, killProcessTree, buildError };
