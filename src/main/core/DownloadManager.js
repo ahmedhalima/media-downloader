@@ -16,6 +16,11 @@ const log = getLogger();
 // find in a stream of otherwise-human-readable yt-dlp output.
 const PROGRESS_MARK = 'MEDIADL_PROGRESS';
 
+// yt-dlp's own default progress line, used as a redundant fallback
+// parser — see the comment where it's used in _handleDownloadLine.
+const STANDARD_PROGRESS_RE =
+  /^\[download\]\s+([\d.]+)%(?:\s+of\s+~?\s*([\d.]+\s*\w+))?(?:\s+at\s+([\d.]+\s*\w+\/s|Unknown speed))?(?:\s+(?:ETA\s+([\d:]+|Unknown)|in\s+([\d:]+)))?/;
+
 const STATUS = Object.freeze({
   QUEUED: 'queued',
   DOWNLOADING: 'downloading',
@@ -279,26 +284,10 @@ class DownloadManager extends EventEmitter {
     }
 
     const settings = this.settingsStore.getAll();
-    const wantsCookies = settings.cookiesFromBrowser && settings.cookiesFromBrowser !== 'none';
 
     try {
       await this._resolveAndSaveManifest(task, provider, settings);
     } catch (err) {
-      if (isCookieFailureMessage(err.message) && wantsCookies) {
-        task.warning = `Couldn't read cookies from ${settings.cookiesFromBrowser} (close it completely, then retry, if you need sign-in access) — continuing as a public stream.`;
-        this._emitUpdate(task);
-        try {
-          await this._resolveAndSaveManifest(task, provider, { ...settings, cookiesFromBrowser: 'none' });
-          return;
-        } catch (retryErr) {
-          log.error(`Live manifest retry without cookies failed for ${task.url}`, retryErr);
-          task.status = STATUS.ERROR;
-          task.error = humanizeError(retryErr);
-          this._emitUpdate(task);
-          this.emit('task:error', this._publicView(task));
-          return;
-        }
-      }
       log.error(`Live manifest download failed for ${task.url}`, err);
       task.status = STATUS.ERROR;
       task.error = humanizeError(err);
@@ -356,36 +345,22 @@ class DownloadManager extends EventEmitter {
 
   async _start(task) {
     const settings = this.settingsStore.getAll();
-    const wantsCookies = settings.cookiesFromBrowser && settings.cookiesFromBrowser !== 'none';
-
-    const result = await this._attemptDownload(task, settings);
-
-    // A browser left open (or locked by another process) makes yt-dlp's
-    // own cookie-database copy fail outright — this is a well-known
-    // yt-dlp limitation (github.com/yt-dlp/yt-dlp/issues/7271), not
-    // something retrying the same command fixes. Retrying once with
-    // cookies turned off lets the download proceed as a public one
-    // instead of failing completely over an optional feature.
-    if (result === 'cookie-failure' && wantsCookies) {
-      task.warning = `Couldn't read cookies from ${settings.cookiesFromBrowser} (close it completely, then retry, if you need sign-in access) — continuing as a public download.`;
-      this._emitUpdate(task);
-      await this._attemptDownload(task, { ...settings, cookiesFromBrowser: 'none' });
-    }
+    await this._attemptDownload(task, settings);
   }
 
   /**
-   * Runs exactly one yt-dlp download attempt for a task. Returns
-   * 'cookie-failure' if it failed specifically because of an unreadable
-   * browser cookie database (so `_start` can decide whether to retry),
-   * or 'done' for any other outcome — success, a normal error, or the
-   * task having been paused/cancelled mid-flight (both already handled
-   * and reflected on the task itself).
+   * Runs one yt-dlp download attempt for a task, from spawn through to
+   * the process closing. All outcomes (success, error, or the task
+   * having been paused/cancelled mid-flight) are reflected directly on
+   * the task object.
    */
   async _attemptDownload(task, settings) {
     task.status = STATUS.DOWNLOADING;
     task.error = null;
     task.rawError = null;
     this._emitUpdate(task);
+
+    const attemptStartedAt = Date.now();
 
     const provider = this.providerManager.resolve(task.url);
     if (!provider) {
@@ -506,6 +481,17 @@ class DownloadManager extends EventEmitter {
           finish('done');
           return;
         }
+
+        // The path yt-dlp printed via --print doesn't always match
+        // reality (this is what caused "Open File" to report the file
+        // as missing even though the video had downloaded). If it's
+        // missing, fall back to whatever media file was most recently
+        // written into the download folder during this attempt.
+        if (!task.filePath || !fs.existsSync(task.filePath)) {
+          const recovered = findMostRecentMediaFile(downloadRoot, attemptStartedAt);
+          if (recovered) task.filePath = recovered;
+        }
+
         if (code === 0) {
           task.status = STATUS.COMPLETED;
           task.progressPercent = 100;
@@ -516,30 +502,19 @@ class DownloadManager extends EventEmitter {
           return;
         }
 
-        // yt-dlp can fail late — e.g. a browser-cookie read for an
-        // unrelated post-step — AFTER the video itself already
-        // finished downloading and was moved to its final filename.
-        // Retrying from scratch in that case just re-downloads a
-        // video that's already complete, wastes bandwidth, and is
-        // what made a cookie error still appear even though the
-        // video had, in fact, already downloaded successfully.
+        // yt-dlp can occasionally fail late — after the video itself
+        // already finished downloading and was moved to its final
+        // filename — due to some unrelated post-step. Retrying from
+        // scratch in that case would just re-download a video that's
+        // already complete and waste bandwidth, so if the file is
+        // genuinely there, this counts as success.
         if (task.filePath && fs.existsSync(task.filePath)) {
           task.status = STATUS.COMPLETED;
           task.progressPercent = 100;
-          if (isCookieFailureMessage(task.rawError)) {
-            task.warning =
-              task.warning ||
-              'The video downloaded successfully. A browser sign-in step failed afterward and was skipped — turn off "Use sign-in from browser" in Settings if you don\'t need it.';
-          }
           this._emitUpdate(task);
           this._recordHistory(task, provider);
           this.emit('task:completed', this._publicView(task));
           finish('done');
-          return;
-        }
-
-        if (isCookieFailureMessage(task.rawError)) {
-          finish('cookie-failure');
           return;
         }
 
@@ -588,6 +563,25 @@ class DownloadManager extends EventEmitter {
       const eta = parseFloat(etaRaw);
       if (!Number.isNaN(eta) && eta >= 0) task.eta = formatEta(eta);
 
+      this._emitUpdate(task);
+      return;
+    }
+
+    // Redundant fallback: parse yt-dlp's own standard, human-readable
+    // progress line too (e.g. "[download]  45.2% of  10.00MiB at
+    // 1.20MiB/s ETA 00:07"). This format has been stable for years and
+    // is independent of the exact field names accepted by
+    // --progress-template above — if that ever mismatches yt-dlp's
+    // expectations for any reason, progress still updates via this
+    // path instead of silently sitting at 0%.
+    const standard = STANDARD_PROGRESS_RE.exec(line);
+    if (standard && task.status === STATUS.DOWNLOADING) {
+      const [, percentStr, sizeStr, speedStr, etaStr] = standard;
+      const percent = parseFloat(percentStr);
+      if (!Number.isNaN(percent)) task.progressPercent = clamp(percent, 0, 100);
+      if (sizeStr) task.totalSizeText = task.totalSizeText || sizeStr.trim();
+      if (speedStr && speedStr !== 'Unknown speed') task.speed = task.speed || speedStr.trim();
+      if (etaStr && etaStr !== 'Unknown') task.eta = task.eta || etaStr.trim();
       this._emitUpdate(task);
       return;
     }
@@ -833,6 +827,51 @@ function formatEta(seconds) {
   if (m < 60) return `${m}:${String(rem).padStart(2, '0')}`;
   const h = Math.floor(m / 60);
   return `${h}:${String(m % 60).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
+}
+
+const MEDIA_FILE_RE = /\.(mp4|mkv|webm|m4a|mp3|opus|ogg|wav|mov|flv|avi)$/i;
+
+/**
+ * Recursively finds the most recently modified media file under `dir`
+ * that was written at or after `sinceMs`, skipping in-progress
+ * (.part/.ytdl) files. Used as a fallback when the path yt-dlp printed
+ * doesn't match anything on disk.
+ */
+function findMostRecentMediaFile(dir, sinceMs) {
+  const best = findMostRecentMediaFileEntry(dir, sinceMs, 0);
+  return best ? best.path : null;
+}
+
+function findMostRecentMediaFileEntry(dir, sinceMs, depth) {
+  if (depth > 2) return null; // organize-by-provider + Live adds at most one extra level
+  let best = null;
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (_) {
+    return null;
+  }
+
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      const nested = findMostRecentMediaFileEntry(full, sinceMs, depth + 1);
+      if (nested && (!best || nested.mtimeMs > best.mtimeMs)) best = nested;
+      continue;
+    }
+    if (entry.name.endsWith('.part') || entry.name.endsWith('.ytdl')) continue;
+    if (!MEDIA_FILE_RE.test(entry.name)) continue;
+    let stat;
+    try {
+      stat = fs.statSync(full);
+    } catch (_) {
+      continue;
+    }
+    if (stat.mtimeMs < sinceMs) continue;
+    if (!best || stat.mtimeMs > best.mtimeMs) best = { path: full, mtimeMs: stat.mtimeMs };
+  }
+
+  return best;
 }
 
 function capitalize(s) {

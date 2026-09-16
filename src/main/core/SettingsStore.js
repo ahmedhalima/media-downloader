@@ -22,12 +22,6 @@ const DEFAULTS = {
   // When true, forces yt-dlp to prefer the original-language audio
   // track over any auto-dubbed tracks a video may offer.
   preferOriginalAudio: true,
-  // Optional: reuse the signed-in session from a browser already
-  // installed on this machine ('none' | 'chrome' | 'edge' | 'firefox' |
-  // 'brave' | 'opera' | 'vivaldi' | 'chromium'). Lets users reach
-  // age-gated or members-only content their OWN account can see.
-  // No password is ever read or stored by this app.
-  cookiesFromBrowser: 'none',
   // YouTube can auto-translate video titles/descriptions server-side
   // based on a language hint yt-dlp sends with each request; left
   // unset, that hint effectively defaults to English, which is why a

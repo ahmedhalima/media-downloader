@@ -150,24 +150,20 @@ Queueing a playlist that includes videos you've already downloaded in
 the same quality no longer fails outright: those entries are skipped
 with a toast telling you how many, and the rest still queue normally.
 
-Settings → **Use sign-in from browser** lets MediaDownloader reuse the
-session from a browser you're already signed into on this PC (Chrome,
-Edge, Firefox, Brave, Opera, Vivaldi, Chromium). This is passed through
-to yt-dlp's `--cookies-from-browser`.
+## No browser sign-in / cookies
 
-This exists so you can download **your own** age-restricted or
-members-only content — it grants no access your account doesn't already
-have, and MediaDownloader never sees, requests, or stores your password.
-It is set to **None** by default.
-
-Note: close the browser fully before downloading. Chromium-based
-browsers lock their cookie database while running, and on Windows they
-additionally encrypt it with DPAPI, so cookie reads fail if the browser
-is open. If that happens, MediaDownloader no longer blocks the whole
-action on it — analyzing, downloading, and resolving a live `.m3u8`
-manifest all automatically retry once without cookies and show a toast
-explaining what happened, instead of failing outright over an optional
-feature.
+MediaDownloader deliberately does not offer a "sign in with your
+browser" option. An earlier version did (passing yt-dlp
+`--cookies-from-browser`), but Chromium-based browsers lock their
+cookie database while running — and on Windows additionally encrypt it
+with DPAPI — so reading it reliably failed unless the browser was
+fully closed first. That made an optional, rarely-needed feature (only
+relevant for private/members-only content) a recurring point of
+failure for downloading ordinary public videos, which is the vast
+majority of what this app is for. It's been removed rather than
+patched further; the app only downloads public, unauthenticated
+content, matching the "no bypassing access restrictions" principle
+this project follows anyway.
 
 ## Notes on the "original audio" and "live → .m3u8" features
 
@@ -205,19 +201,25 @@ folder.
 ## Download engine
 
 Downloads run through a direct, self-managed yt-dlp process rather than
-a third-party wrapper library, for two reasons that both turned out to
-matter in practice:
+a third-party wrapper library, for reasons that turned out to matter in
+practice:
 
-- **Real progress.** A custom `--progress-template` prints one
-  unambiguous line per update, which this app parses itself — instead
-  of relying on a wrapper's regex match against yt-dlp's default
-  human-readable progress bar, which could silently produce no
-  progress events at all (a download would sit at 0% until it finished).
+- **Real progress, redundantly.** A custom `--progress-template` prints
+  one unambiguous line per update, parsed directly — no relying on a
+  wrapper's regex against yt-dlp's default progress bar (which could
+  silently produce no progress at all). As a safety net, yt-dlp's own
+  standard `[download] 45.2% of 10.00MiB at 1.20MiB/s ETA 00:07` format
+  is *also* parsed independently, so progress still shows even if one
+  parsing path ever mismatches a yt-dlp version's exact field names.
 - **A real Cancel/Pause.** Stopping a download kills the *whole*
   process tree (`taskkill /t /f` on Windows), not just the yt-dlp
-  process itself. yt-dlp spawns ffmpeg as a child process for merging;
-  killing only the parent left that ffmpeg child running, so a
-  "cancelled" download kept writing the output file in the background.
+  process — it spawns ffmpeg as a child for merging, and killing only
+  the parent left that ffmpeg process running in the background.
+- **File-path recovery.** The filename yt-dlp reports back isn't always
+  the one that ends up on disk (a possible source of "file not found"
+  when opening a completed download). If the reported path doesn't
+  exist, MediaDownloader falls back to the most recently created media
+  file in the download folder from that download attempt.
 
 ## Live videos
 

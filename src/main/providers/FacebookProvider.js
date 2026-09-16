@@ -47,12 +47,8 @@ class FacebookProvider extends BaseProvider {
   }
 
   /** Metadata-extraction args (no download-time format sorting). */
-  analyzeArgs(settings = {}) {
-    const args = ['--no-warnings', '--ignore-config'];
-    if (settings.cookiesFromBrowser && settings.cookiesFromBrowser !== 'none') {
-      args.push('--cookies-from-browser', settings.cookiesFromBrowser);
-    }
-    return args;
+  analyzeArgs() {
+    return ['--no-warnings', '--ignore-config'];
   }
 
   buildFormatSelector(qualityId, audioOnly, { isLive = false } = {}) {
@@ -80,9 +76,6 @@ class FacebookProvider extends BaseProvider {
     const args = ['--no-warnings'];
     if (settings.preferOriginalAudio !== false) {
       args.push('--format-sort', 'lang');
-    }
-    if (settings.cookiesFromBrowser && settings.cookiesFromBrowser !== 'none') {
-      args.push('--cookies-from-browser', settings.cookiesFromBrowser);
     }
     return args;
   }

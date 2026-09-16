@@ -627,7 +627,6 @@ function applySettingsToUi(s) {
   document.getElementById('defaultQualitySelect').value = s.defaultQuality;
   document.getElementById('preferOriginalAudioToggle').checked = s.preferOriginalAudio;
   document.getElementById('audioFormatSelect').value = s.preferredAudioFormat;
-  document.getElementById('cookiesBrowserSelect').value = s.cookiesFromBrowser || 'none';
   document.getElementById('metadataLanguageSelect').value = s.metadataLanguage || 'auto';
   document.getElementById('concurrencyInput').value = s.maxConcurrentDownloads;
   document.getElementById('maxRetriesInput').value = s.maxRetries;
@@ -656,7 +655,6 @@ bindSetting('organizeByProviderToggle', 'organizeByProvider');
 bindSetting('deletePartialToggle', 'deletePartialOnCancel');
 bindSetting('preferOriginalAudioToggle', 'preferOriginalAudio');
 bindSetting('audioFormatSelect', 'preferredAudioFormat');
-bindSetting('cookiesBrowserSelect', 'cookiesFromBrowser');
 bindSetting('metadataLanguageSelect', 'metadataLanguage');
 bindSetting('concurrencyInput', 'maxConcurrentDownloads', (v) => parseInt(v, 10) || 1);
 bindSetting('maxRetriesInput', 'maxRetries', (v) => parseInt(v, 10) || 0);

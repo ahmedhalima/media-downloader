@@ -177,11 +177,7 @@ class YouTubeProvider extends BaseProvider {
    * failure surface to a JSON dump.
    */
   analyzeArgs(settings = {}) {
-    const args = ['--no-warnings', '--ignore-config', ...this.metadataLangArgs(settings)];
-    if (settings.cookiesFromBrowser && settings.cookiesFromBrowser !== 'none') {
-      args.push('--cookies-from-browser', settings.cookiesFromBrowser);
-    }
-    return args;
+    return ['--no-warnings', '--ignore-config', ...this.metadataLangArgs(settings)];
   }
 
   /**
@@ -211,13 +207,6 @@ class YouTubeProvider extends BaseProvider {
       // YouTube auto-dubs many videos. Sorting on "lang" (and never
       // requesting a specific dub) makes yt-dlp prefer the original.
       args.push('--format-sort', 'lang');
-    }
-
-    // Reuses a browser session the user is already signed into on this
-    // machine. No password is seen or stored, and it grants no access
-    // the user doesn't already have.
-    if (settings.cookiesFromBrowser && settings.cookiesFromBrowser !== 'none') {
-      args.push('--cookies-from-browser', settings.cookiesFromBrowser);
     }
 
     return args;

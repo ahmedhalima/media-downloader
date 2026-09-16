@@ -5,7 +5,6 @@ const fs = require('fs');
 const path = require('path');
 const { getLogger } = require('../utils/logger');
 const { runYtDlp } = require('../utils/ytdlpRunner');
-const { isCookieFailureMessage } = require('../core/DownloadManager');
 
 const log = getLogger();
 
@@ -47,29 +46,6 @@ function registerIpcHandlers({
       return await provider.analyze(url, ytDlpWrap, { settings, forcePlaylist, run });
     } catch (err) {
       log.error(`Analyze failed for ${url}`, { message: err.message, stderr: err.stderr, args: err.args });
-
-      // A browser left open (or a permissions issue) can make reading
-      // its cookie database fail outright, which used to block
-      // analyzing ANY link whenever "Use sign-in from browser" was
-      // set — even public videos that never needed cookies. Retry
-      // once without cookies instead of hard-failing.
-      const isCookieFailure = isCookieFailureMessage(err.message || '');
-      if (isCookieFailure && settings.cookiesFromBrowser && settings.cookiesFromBrowser !== 'none') {
-        try {
-          const result = await provider.analyze(url, ytDlpWrap, {
-            settings: { ...settings, cookiesFromBrowser: 'none' },
-            forcePlaylist,
-            run
-          });
-          result.warning =
-            `Couldn't read cookies from ${settings.cookiesFromBrowser} (close it fully and retry if you need sign-in access) — analyzed as a public video instead.`;
-          return result;
-        } catch (retryErr) {
-          log.error(`Analyze retry without cookies failed for ${url}`, { message: retryErr.message });
-          throw new Error(humanizeAnalyzeError(retryErr));
-        }
-      }
-
       throw new Error(humanizeAnalyzeError(err));
     }
   });
