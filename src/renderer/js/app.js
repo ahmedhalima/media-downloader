@@ -456,6 +456,17 @@ function renderTaskRow(t) {
             el('div', { class: 'progress-fill', style: `width:${t.progressPercent || 0}%` })
           )
         ]
+      : []),
+    ...(t.status === 'downloading'
+      ? [
+          el(
+            'div',
+            { class: 'debug-line' },
+            t.rawLineCount
+              ? `${t.rawLineCount} line${t.rawLineCount === 1 ? '' : 's'} received · last: ${t.lastRawLine || ''}`
+              : 'Waiting for yt-dlp output…'
+          )
+        ]
       : [])
   ]);
 

@@ -554,6 +554,16 @@ class DownloadManager extends EventEmitter {
     const line = rawLine.trim();
     if (!line) return;
 
+    // Visible diagnostics: a running count of stdout lines received
+    // and the most recent one, shown directly on the task row. This
+    // makes it possible to tell apart, from inside the app, whether
+    // (a) no output is arriving from yt-dlp at all, (b) output is
+    // arriving but isn't a progress line, or (c) a progress line is
+    // arriving but failing to parse — three very different problems
+    // that all otherwise look identical ("progress isn't moving").
+    task.rawLineCount = (task.rawLineCount || 0) + 1;
+    task.lastRawLine = line.slice(0, 160);
+
     if (line.startsWith('MEDIADL_FILEPATH:')) {
       task.filePath = line.slice('MEDIADL_FILEPATH:'.length).trim();
       return;
@@ -586,7 +596,7 @@ class DownloadManager extends EventEmitter {
       return;
     }
 
-    // Redundant fallback: parse yt-dlp's own standard, human-readable
+    // Redundant fallback #1: parse yt-dlp's own standard, human-readable
     // progress line too (e.g. "[download]  45.2% of  10.00MiB at
     // 1.20MiB/s ETA 00:07"). This format has been stable for years and
     // is independent of the exact field names accepted by
@@ -605,8 +615,42 @@ class DownloadManager extends EventEmitter {
       return;
     }
 
+    // Redundant fallback #2: last resort. If neither of the above
+    // matched but the line still looks like a yt-dlp progress update
+    // (starts with "[download]" and contains a percentage), just pull
+    // the number out directly. This deliberately doesn't care about
+    // exact spacing/wording — it only needs one number — so it keeps
+    // the percentage moving even if yt-dlp's exact output format ever
+    // drifts from what the two parsers above expect.
+    if (task.status === STATUS.DOWNLOADING && /^\[download\]/i.test(line)) {
+      const bare = /(\d+(?:\.\d+)?)\s*%/.exec(line);
+      if (bare) {
+        const percent = parseFloat(bare[1]);
+        if (!Number.isNaN(percent)) {
+          task.progressPercent = clamp(percent, 0, 100);
+          this._emitUpdate(task);
+          return;
+        }
+      }
+    }
+
     if (/^ERROR[:\s]/i.test(line)) {
       task.rawError = line;
+    }
+
+    // Captures a sample of raw yt-dlp output for diagnosing progress
+    // issues that make it past all three parsers above. Bounded to
+    // avoid flooding the log on a long download.
+    if (task.status === STATUS.DOWNLOADING && (task.rawLineCount || 0) <= 40) {
+      log.info(`[progress-debug] unrecognized line: ${line.slice(0, 200)}`);
+    }
+
+    // Push the raw line counter/preview to the UI too — every line
+    // while the count is still low (so a video that produces almost
+    // no output is visible immediately), then every 5th line after
+    // that so a long download doesn't flood IPC with no-op updates.
+    if (task.status === STATUS.DOWNLOADING && (task.rawLineCount <= 20 || task.rawLineCount % 5 === 0)) {
+      this._emitUpdate(task);
     }
   }
 

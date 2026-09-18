@@ -13,6 +13,12 @@ const { app, BrowserWindow, Menu, shell, dialog } = require('electron');
 // before yt-dlp-wrap or anything else spawns the binary.
 process.env.PYTHONUTF8 = '1';
 process.env.PYTHONIOENCODING = 'utf-8';
+// Python fully buffers stdout by default when it's not attached to a
+// terminal (i.e. when piped, as here) — without this, yt-dlp's
+// progress output can sit in an internal buffer and only get flushed
+// in large chunks or at process exit, which looks exactly like
+// progress being stuck at 0% until the download finishes.
+process.env.PYTHONUNBUFFERED = '1';
 
 const { getLogger } = require('./utils/logger');
 const { SettingsStore } = require('./core/SettingsStore');

@@ -249,6 +249,7 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
 .item-row[data-status="error"] .progress-fill { background: var(--danger); }
 .item-row[data-status="paused"] .progress-fill { background: var(--warn); }
 .item-row[data-status="completed"] .progress-fill { background: var(--accent); }
+.debug-line { font-size: 10px; color: var(--text-faint); font-family: var(--mono); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .status-chip {
   font-size: 10.5px;

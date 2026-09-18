@@ -18,7 +18,7 @@ function runYtDlp(binaryPath, args, { timeoutMs = 120000 } = {}) {
 
     const child = spawn(binaryPath, args, {
       windowsHide: true,
-      env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' }
+      env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1' }
     });
 
     const timer = setTimeout(() => {
@@ -72,7 +72,7 @@ function spawnManaged(binaryPath, args) {
   return spawn(binaryPath, args, {
     windowsHide: true,
     detached: process.platform !== 'win32',
-    env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' }
+    env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1' }
   });
 }
 

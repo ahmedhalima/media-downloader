@@ -198,6 +198,24 @@ they don't apply, and path segments that collapse to nothing are
 dropped — so downloading a single video no longer creates a stray `NA`
 folder.
 
+## Diagnosing "progress isn't showing"
+
+Every actively-downloading item now shows a small line under its
+progress bar: how many lines of output have been received from
+yt-dlp so far, and the most recent one — e.g. `142 lines received ·
+last: [download]  45.2% of  10.00MiB at  1.20MiB/s ETA 00:07`. This
+tells apart three different problems that otherwise all look like
+"progress is stuck":
+
+- **0 lines, stays at "Waiting for yt-dlp output…"** — no output is
+  arriving from the process at all (a spawn, environment, or binary
+  problem, not a parsing one).
+- **Lines are arriving, but percent still isn't moving** — the output
+  is real but isn't matching any of the three parsers this app tries;
+  the actual line shown is exactly what a fix needs to target.
+- **Percent moves but the number seems wrong** — a data problem
+  further downstream, not a missing-output problem.
+
 ## Speed and reliability
 
 yt-dlp has no connection timeout by default — a stalled or slow-to-
@@ -219,13 +237,18 @@ Downloads run through a direct, self-managed yt-dlp process rather than
 a third-party wrapper library, for reasons that turned out to matter in
 practice:
 
-- **Real progress, redundantly.** A custom `--progress-template` prints
-  one unambiguous line per update, parsed directly — no relying on a
-  wrapper's regex against yt-dlp's default progress bar (which could
-  silently produce no progress at all). As a safety net, yt-dlp's own
-  standard `[download] 45.2% of 10.00MiB at 1.20MiB/s ETA 00:07` format
-  is *also* parsed independently, so progress still shows even if one
-  parsing path ever mismatches a yt-dlp version's exact field names.
+- **Real progress, redundantly.** Python fully buffers its stdout by
+  default when it isn't attached to a terminal — which is exactly the
+  case when this app pipes yt-dlp's output — so progress updates could
+  sit in an internal buffer and only get flushed in large chunks or at
+  process exit, looking exactly like "stuck at 0% until it finishes."
+  Setting `PYTHONUNBUFFERED=1` on the yt-dlp process forces it to
+  stream output as it happens instead. On top of that, progress is
+  parsed through three independent layers — a custom
+  `--progress-template`, yt-dlp's own standard `[download] 45.2% of...`
+  format, and a last-resort bare-percentage scan — so progress keeps
+  working even if any one layer ever mismatches a given yt-dlp
+  version's exact output.
 - **A real Cancel/Pause.** Stopping a download kills the *whole*
   process tree (`taskkill /t /f` on Windows), not just the yt-dlp
   process — it spawns ffmpeg as a child for merging, and killing only
