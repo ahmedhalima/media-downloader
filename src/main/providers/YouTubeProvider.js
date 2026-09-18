@@ -177,7 +177,7 @@ class YouTubeProvider extends BaseProvider {
    * failure surface to a JSON dump.
    */
   analyzeArgs(settings = {}) {
-    return ['--no-warnings', '--ignore-config', ...this.metadataLangArgs(settings)];
+    return ['--no-warnings', '--ignore-config', ...this.networkArgs(), ...this.metadataLangArgs(settings)];
   }
 
   /**
@@ -201,7 +201,7 @@ class YouTubeProvider extends BaseProvider {
   }
 
   extraArgs(settings = {}) {
-    const args = ['--no-warnings', ...this.metadataLangArgs(settings)];
+    const args = ['--no-warnings', ...this.networkArgs({ forDownload: true }), ...this.metadataLangArgs(settings)];
 
     if (settings.preferOriginalAudio !== false) {
       // YouTube auto-dubs many videos. Sorting on "lang" (and never

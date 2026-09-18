@@ -62,7 +62,7 @@ class DownloadManager extends EventEmitter {
    * real cause rather than just the command that failed.
    */
   runYtDlp(args) {
-    return runYtDlp(this.ytDlpPath, args, { timeoutMs: 120000 });
+    return runYtDlp(this.ytDlpPath, args, { timeoutMs: 60000 });
   }
 
   /**
@@ -345,19 +345,34 @@ class DownloadManager extends EventEmitter {
 
   async _start(task) {
     const settings = this.settingsStore.getAll();
-    await this._attemptDownload(task, settings);
+    const result = await this._attemptDownload(task, settings);
+
+    // Covers any remaining case where our computed selector genuinely
+    // doesn't match anything yt-dlp offers for a live stream — rather
+    // than keep guessing at the exact right selector, fall back to
+    // letting yt-dlp choose with no constraints at all, which is the
+    // most permissive request possible.
+    if (result === 'format-unavailable') {
+      task.warning =
+        'The requested quality wasn\'t available for this live stream — retried letting yt-dlp choose automatically.';
+      this._emitUpdate(task);
+      await this._attemptDownload(task, settings, { omitFormat: true });
+    }
   }
 
   /**
    * Runs one yt-dlp download attempt for a task, from spawn through to
    * the process closing. All outcomes (success, error, or the task
    * having been paused/cancelled mid-flight) are reflected directly on
-   * the task object.
+   * the task object. Returns 'format-unavailable' specifically when a
+   * live video's requested format couldn't be matched, so `_start` can
+   * decide whether to retry with no format constraint at all.
    */
-  async _attemptDownload(task, settings) {
+  async _attemptDownload(task, settings, { omitFormat = false } = {}) {
     task.status = STATUS.DOWNLOADING;
     task.error = null;
     task.rawError = null;
+    task.formatOmitted = omitFormat;
     this._emitUpdate(task);
 
     const attemptStartedAt = Date.now();
@@ -383,13 +398,13 @@ class DownloadManager extends EventEmitter {
       buildOutputPath(downloadRoot, settings.filenameTemplate),
       task
     );
-    const formatSelector = provider.buildFormatSelector(task.qualityId, task.audioOnly, {
-      isLive: task.isLive
-    });
+    const formatSelector = omitFormat
+      ? null
+      : provider.buildFormatSelector(task.qualityId, task.audioOnly, { isLive: task.isLive });
 
     const args = [
       task.url,
-      '-f', formatSelector,
+      ...(formatSelector ? ['-f', formatSelector] : []),
       '-o', outputTemplate,
       '--ffmpeg-location', this.ffmpegPath,
       '--newline',
@@ -519,6 +534,10 @@ class DownloadManager extends EventEmitter {
         }
 
         if (task.status !== STATUS.COMPLETED) {
+          if (task.isLive && !task.formatOmitted && /Requested format is not available/i.test(task.rawError || '')) {
+            finish('format-unavailable');
+            return;
+          }
           task.status = STATUS.ERROR;
           task.error =
             task.error || (task.rawError ? humanizeError(new Error(task.rawError)) : `yt-dlp exited with code ${code}`);

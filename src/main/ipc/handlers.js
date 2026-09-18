@@ -39,7 +39,7 @@ function registerIpcHandlers({
     // Providers receive a runner that captures yt-dlp's stderr, so a
     // failure reports what actually went wrong rather than just the
     // command line that failed.
-    const run = (args) => runYtDlp(binaryManager.ytDlpPath, args, { timeoutMs: 180000 });
+    const run = (args) => runYtDlp(binaryManager.ytDlpPath, args, { timeoutMs: 60000 });
     const settings = settingsStore.getAll();
 
     try {

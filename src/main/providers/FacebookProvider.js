@@ -48,7 +48,7 @@ class FacebookProvider extends BaseProvider {
 
   /** Metadata-extraction args (no download-time format sorting). */
   analyzeArgs() {
-    return ['--no-warnings', '--ignore-config'];
+    return ['--no-warnings', '--ignore-config', ...this.networkArgs()];
   }
 
   buildFormatSelector(qualityId, audioOnly, { isLive = false } = {}) {
@@ -73,7 +73,7 @@ class FacebookProvider extends BaseProvider {
   }
 
   extraArgs(settings = {}) {
-    const args = ['--no-warnings'];
+    const args = ['--no-warnings', ...this.networkArgs({ forDownload: true })];
     if (settings.preferOriginalAudio !== false) {
       args.push('--format-sort', 'lang');
     }

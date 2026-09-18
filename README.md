@@ -198,6 +198,21 @@ they don't apply, and path segments that collapse to nothing are
 dropped — so downloading a single video no longer creates a stray `NA`
 folder.
 
+## Speed and reliability
+
+yt-dlp has no connection timeout by default — a stalled or slow-to-
+respond connection can hang indefinitely with no error, which is what
+made analyzing a video feel like it never finished. MediaDownloader now
+sets an explicit socket timeout (15s for analyze, 20s for downloads)
+so a stuck connection fails fast and can be retried, instead of sitting
+there silently.
+
+Downloads also fetch fragments (YouTube delivers video in segments)
+four at a time in parallel instead of one at a time, and retry
+individual failed fragments up to 10 times rather than failing the
+whole download over one bad segment — both faster and less prone to
+failing outright on an imperfect connection.
+
 ## Download engine
 
 Downloads run through a direct, self-managed yt-dlp process rather than
@@ -228,7 +243,12 @@ already-muxed video+audio variants — there's usually no separate
 audio-only stream to pair with a video-only one. The normal
 `bestvideo+bestaudio` selector demanding that pairing is what produced
 "Requested format is not available" for live videos specifically; live
-downloads now use a simpler, merge-free selector instead.
+downloads use a simpler, merge-free selector instead.
+
+If a live stream's format still can't be matched even with that
+simpler selector, MediaDownloader retries once more with no format
+constraint at all — letting yt-dlp pick automatically — rather than
+failing outright. A toast explains when this happens.
 
 ## Resuming after closing the app
 

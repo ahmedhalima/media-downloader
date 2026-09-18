@@ -54,6 +54,36 @@ class BaseProvider {
   }
 
   /**
+   * Network flags shared by analyze and download. yt-dlp has NO
+   * connection timeout by default — a stalled or slow-to-respond
+   * connection can hang indefinitely with no error and no way to tell
+   * it's stuck, which is what made "analyzing" feel like it never
+   * finished. A socket timeout turns a silent hang into a fast,
+   * retryable failure instead.
+   */
+  networkArgs({ forDownload = false } = {}) {
+    return forDownload
+      ? [
+          '--socket-timeout', '20',
+          '--retries', '10',
+          // Fragment-level retries matter more than whole-file retries
+          // for YouTube's segmented (DASH/HLS) delivery — one bad
+          // segment shouldn't fail the entire download.
+          '--fragment-retries', '10',
+          // Fetches multiple fragments in parallel instead of one at a
+          // time, which is both faster and less likely to have the
+          // whole download stall on a single slow segment.
+          '--concurrent-fragments', '4'
+        ]
+      : [
+          // Analyze is a quick metadata read — fail fast rather than
+          // hang, since the user is actively waiting on this one.
+          '--socket-timeout', '15',
+          '--retries', '3'
+        ];
+  }
+
+  /**
    * Args used to resolve a live stream's HLS manifest URL for the
    * "save as .m3u8" feature.
    *
